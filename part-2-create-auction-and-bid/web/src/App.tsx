@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 
 import { ActiveUserProvider, useActiveUser } from './activeUser';
 import { HealthStatus } from './components/HealthStatus';
@@ -7,8 +7,8 @@ import { ProductCard } from './components/ProductCard';
 import { SiteHeader } from './components/SiteHeader';
 import { UserSwitcher } from './components/UserSwitcher';
 import { NewAuctionPage } from './pages/NewAuctionPage';
-import type { Auction } from './types';
-import { formatCurrencyFromCents } from './types';
+import type { Auction, Bid } from './types';
+import { dollarsToCents, formatCurrencyFromCents } from './types';
 
 const themes = [
   { id: 'market', name: 'Market', description: 'Bright & modern' },
@@ -131,8 +131,12 @@ function HomePage({ theme, onThemeChange }: { theme: Theme; onThemeChange: (next
 
 function ItemPage({ slug }: { slug: string }) {
   const [auction, setAuction] = useState<Auction | null>(null);
+  const [bids, setBids] = useState<Bid[]>([]);
   const [loading, setLoading] = useState(true);
   const [missing, setMissing] = useState(false);
+  const [bidAmount, setBidAmount] = useState('');
+  const [bidError, setBidError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
   const { activeUser } = useActiveUser();
 
   useEffect(() => {
@@ -147,8 +151,10 @@ function ItemPage({ slug }: { slug: string }) {
           return;
         }
         if (!response.ok) throw new Error('failed');
-        const body = (await response.json()) as { auction: Auction };
+        const body = (await response.json()) as { auction: Auction; bids: Bid[] };
         setAuction(body.auction);
+        setBids(body.bids ?? []);
+        setBidAmount((body.auction.minimumBidCents / 100).toFixed(2));
       } catch (err) {
         if ((err as Error).name === 'AbortError') return;
         setMissing(true);
@@ -171,6 +177,57 @@ function ItemPage({ slug }: { slug: string }) {
         <a href="/">Return to the auction house</a>
       </main>
     );
+  }
+
+  const isSeller = Boolean(activeUser && activeUser.id === auction.seller.id);
+  const canBid = Boolean(activeUser) && !auction.ended && !isSeller;
+  const bidBlockedReason = auction.ended
+    ? 'This auction has ended. Bidding is closed.'
+    : isSeller
+      ? 'You are the seller. Bidding is unavailable on your own auction.'
+      : !activeUser
+        ? 'Choose an active user in the footer to bid.'
+        : null;
+
+  async function onPlaceBid(event: FormEvent) {
+    event.preventDefault();
+    if (!auction || !activeUser || !canBid) return;
+    setBidError(null);
+
+    const amountCents = dollarsToCents(bidAmount);
+    if (amountCents === null) {
+      setBidError('Enter a valid dollar amount like 101.00.');
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const response = await fetch(`/api/auctions/${encodeURIComponent(auction.slug)}/bids`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bidderId: activeUser.id, amountCents }),
+      });
+      const body = (await response.json()) as {
+        auction?: Auction;
+        bids?: Bid[];
+        error?: string;
+        minimumBidCents?: number;
+      };
+      if (!response.ok || !body.auction) {
+        setBidError(body.error ?? 'Could not place bid.');
+        if (body.minimumBidCents) {
+          setBidAmount((body.minimumBidCents / 100).toFixed(2));
+        }
+        return;
+      }
+      setAuction(body.auction);
+      setBids(body.bids ?? []);
+      setBidAmount((body.auction.minimumBidCents / 100).toFixed(2));
+    } catch {
+      setBidError('Could not place bid.');
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -201,24 +258,30 @@ function ItemPage({ slug }: { slug: string }) {
               <strong>{auction.leadingBidder?.displayName ?? '—'}</strong>
             </div>
             <div className="ending">
-              <span>Auction closes in</span>
+              <span>{auction.ended ? 'Auction ended' : 'Auction closes in'}</span>
               <strong>{auction.timeLeft}</strong>
             </div>
-            <form className="bid-form" onSubmit={(event) => event.preventDefault()}>
-              <label htmlFor="bid">Your maximum bid</label>
+            <form className="bid-form" onSubmit={onPlaceBid}>
+              <label htmlFor="bid">Your bid</label>
               <div>
                 <span>$</span>
                 <input
                   id="bid"
                   inputMode="decimal"
-                  placeholder={String(auction.currentAmountCents / 100 + 1)}
-                  disabled
+                  value={bidAmount}
+                  onChange={(event) => setBidAmount(event.target.value)}
+                  placeholder={(auction.minimumBidCents / 100).toFixed(2)}
+                  disabled={!canBid || submitting}
                 />
-                <button type="submit" disabled>Place a bid <span aria-hidden="true">↗</span></button>
+                <button type="submit" disabled={!canBid || submitting}>
+                  {submitting ? 'Bidding…' : <>Place a bid <span aria-hidden="true">↗</span></>}
+                </button>
               </div>
               <small>
-                Bidding arrives in Slice 3. Active user: {activeUser?.displayName ?? 'none selected'}.
+                Minimum next bid: {formatCurrencyFromCents(auction.minimumBidCents)}.
+                {bidBlockedReason ? ` ${bidBlockedReason}` : null}
               </small>
+              {bidError ? <p className="form-error" role="alert">{bidError}</p> : null}
             </form>
           </div>
           <div className="seller-card">
@@ -247,6 +310,23 @@ function ItemPage({ slug }: { slug: string }) {
           </section>
         ) : null}
       </div>
+      <section className="bid-history" aria-label="Bid history">
+        <p className="eyebrow">Bid history</p>
+        <h2>Who has bid</h2>
+        {bids.length === 0 ? (
+          <p className="bid-history-empty">No bids yet.</p>
+        ) : (
+          <ul>
+            {bids.map((bid) => (
+              <li key={bid.id}>
+                <strong>{bid.bidder.displayName}</strong>
+                <span>{formatCurrencyFromCents(bid.amountCents)}</span>
+                <time dateTime={bid.createdAt}>{new Date(bid.createdAt).toLocaleString()}</time>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
       <a className="back-link" href="/">← Back to all auctions</a>
     </main>
   );

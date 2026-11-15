@@ -8,6 +8,8 @@ import { artForCategory, CATEGORY_NAMES } from './categories.js';
 const connectionString =
   process.env.DATABASE_URL ?? 'postgres://auction:auction@localhost:55432/auction_part_2';
 
+const MIN_INCREMENT_CENTS = 100;
+
 type UserRow = {
   id: string;
   handle: string;
@@ -37,6 +39,15 @@ type AuctionRow = {
   leading_bidder_display_name: string | null;
 };
 
+type BidRow = {
+  id: string;
+  amount_cents: number;
+  created_at: Date;
+  bidder_id: string;
+  bidder_handle: string;
+  bidder_display_name: string;
+};
+
 const createAuctionSchema = z.object({
   sellerId: z.string().uuid(),
   title: z.string().trim().min(1).max(120),
@@ -48,6 +59,11 @@ const createAuctionSchema = z.object({
   closingTime: z
     .string()
     .refine((value) => !Number.isNaN(Date.parse(value)), 'Closing time must be a valid timestamp'),
+});
+
+const placeBidSchema = z.object({
+  bidderId: z.string().uuid(),
+  amountCents: z.number().int().positive(),
 });
 
 function formatTimeLeft(closingTime: Date, now = new Date()): string {
@@ -80,6 +96,7 @@ function serializeAuction(row: AuctionRow) {
     closingTime: closingTime.toISOString(),
     timeLeft: formatTimeLeft(closingTime),
     ended: closingTime.getTime() <= Date.now(),
+    minimumBidCents: row.current_amount_cents + MIN_INCREMENT_CENTS,
     specifications: row.specifications ?? [],
     seller: {
       id: row.seller_id,
@@ -93,6 +110,19 @@ function serializeAuction(row: AuctionRow) {
           displayName: row.leading_bidder_display_name,
         }
       : null,
+  };
+}
+
+function serializeBid(row: BidRow) {
+  return {
+    id: row.id,
+    amountCents: row.amount_cents,
+    createdAt: new Date(row.created_at).toISOString(),
+    bidder: {
+      id: row.bidder_id,
+      handle: row.bidder_handle,
+      displayName: row.bidder_display_name,
+    },
   };
 }
 
@@ -117,6 +147,20 @@ const auctionSelect = `
   JOIN users seller ON seller.id = a.seller_id
   LEFT JOIN users leader ON leader.id = a.leading_bidder_id
 `;
+
+async function loadBids(pool: pg.Pool | pg.PoolClient, auctionId: string) {
+  const result = await pool.query<BidRow>(
+    `SELECT
+      b.id, b.amount_cents, b.created_at,
+      b.bidder_id, u.handle AS bidder_handle, u.display_name AS bidder_display_name
+    FROM bids b
+    JOIN users u ON u.id = b.bidder_id
+    WHERE b.auction_id = $1
+    ORDER BY b.created_at DESC, b.amount_cents DESC`,
+    [auctionId]
+  );
+  return result.rows.map(serializeBid);
+}
 
 export function buildApp() {
   const app = Fastify({ logger: true, requestIdHeader: 'x-request-id' });
@@ -226,7 +270,7 @@ export function buildApp() {
       return reply.code(500).send({ error: 'Auction created but could not be loaded' });
     }
 
-    return reply.code(201).send({ auction: serializeAuction(row) });
+    return reply.code(201).send({ auction: serializeAuction(row), bids: [] });
   });
 
   app.get<{ Params: { slug: string } }>('/api/auctions/:slug', async (request, reply) => {
@@ -238,7 +282,100 @@ export function buildApp() {
     if (!row) {
       return reply.code(404).send({ error: 'Auction not found' });
     }
-    return { auction: serializeAuction(row) };
+    const bids = await loadBids(pool, row.id);
+    return { auction: serializeAuction(row), bids };
+  });
+
+  app.post<{ Params: { slug: string } }>('/api/auctions/:slug/bids', async (request, reply) => {
+    const parsed = placeBidSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: 'Invalid bid',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    const { bidderId, amountCents } = parsed.data;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const locked = await client.query<{
+        id: string;
+        seller_id: string;
+        current_amount_cents: number;
+        closing_time: Date;
+      }>(
+        `SELECT id, seller_id, current_amount_cents, closing_time
+         FROM auctions
+         WHERE slug = $1
+         FOR UPDATE`,
+        [request.params.slug]
+      );
+      const auction = locked.rows[0];
+      if (!auction) {
+        await client.query('ROLLBACK');
+        return reply.code(404).send({ error: 'Auction not found' });
+      }
+
+      if (new Date(auction.closing_time).getTime() <= Date.now()) {
+        await client.query('ROLLBACK');
+        return reply.code(400).send({ error: 'This auction has ended' });
+      }
+
+      if (auction.seller_id === bidderId) {
+        await client.query('ROLLBACK');
+        return reply.code(403).send({ error: 'Sellers cannot bid on their own auctions' });
+      }
+
+      const bidder = await client.query<UserRow>(
+        'SELECT id, handle, display_name FROM users WHERE id = $1',
+        [bidderId]
+      );
+      if (!bidder.rows[0]) {
+        await client.query('ROLLBACK');
+        return reply.code(400).send({ error: 'Bidder not found' });
+      }
+
+      const minimumBidCents = auction.current_amount_cents + MIN_INCREMENT_CENTS;
+      if (amountCents < minimumBidCents) {
+        await client.query('ROLLBACK');
+        return reply.code(400).send({
+          error: `Bid must be at least $1.00 above the current amount (minimum ${minimumBidCents} cents)`,
+          minimumBidCents,
+        });
+      }
+
+      const bidId = randomUUID();
+      await client.query(
+        `INSERT INTO bids (id, auction_id, bidder_id, amount_cents)
+         VALUES ($1, $2, $3, $4)`,
+        [bidId, auction.id, bidderId, amountCents]
+      );
+      await client.query(
+        `UPDATE auctions
+         SET current_amount_cents = $1,
+             bid_count = bid_count + 1,
+             leading_bidder_id = $2
+         WHERE id = $3`,
+        [amountCents, bidderId, auction.id]
+      );
+
+      await client.query('COMMIT');
+
+      const updated = await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id]);
+      const row = updated.rows[0];
+      if (!row) {
+        return reply.code(500).send({ error: 'Bid saved but auction could not be reloaded' });
+      }
+      const bids = await loadBids(pool, row.id);
+      return reply.code(201).send({ auction: serializeAuction(row), bids });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   });
 
   app.addHook('onClose', async () => pool.end());
