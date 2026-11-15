@@ -129,6 +129,16 @@ function HomePage({ theme, onThemeChange }: { theme: Theme; onThemeChange: (next
   );
 }
 
+function formatLiveCountdown(closingTime: string, nowMs: number): { label: string; ended: boolean } {
+  const remaining = new Date(closingTime).getTime() - nowMs;
+  if (remaining <= 0) return { label: 'ENDED', ended: true };
+  const totalSeconds = Math.ceil(remaining / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes > 0) return { label: `${minutes}m ${String(seconds).padStart(2, '0')}s`, ended: false };
+  return { label: `${seconds}s`, ended: false };
+}
+
 function ItemPage({ slug }: { slug: string }) {
   const [auction, setAuction] = useState<Auction | null>(null);
   const [bids, setBids] = useState<Bid[]>([]);
@@ -137,32 +147,66 @@ function ItemPage({ slug }: { slug: string }) {
   const [bidAmount, setBidAmount] = useState('');
   const [bidError, setBidError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [activity, setActivity] = useState<string[]>([]);
   const { activeUser } = useActiveUser();
+
+  function pushActivity(line: string) {
+    const stamp = new Date().toLocaleTimeString();
+    setActivity((current) => [`${stamp} · ${line}`, ...current].slice(0, 12));
+  }
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
-    (async () => {
+    let seenBidIds = new Set<string>();
+
+    async function loadAuction(isPoll: boolean) {
       try {
         const response = await fetch(`/api/auctions/${encodeURIComponent(slug)}`, {
           signal: controller.signal,
         });
         if (response.status === 404) {
-          setMissing(true);
+          if (!isPoll) setMissing(true);
           return;
         }
         if (!response.ok) throw new Error('failed');
         const body = (await response.json()) as { auction: Auction; bids: Bid[] };
         setAuction(body.auction);
-        setBids(body.bids ?? []);
-        setBidAmount((body.auction.minimumBidCents / 100).toFixed(2));
+        const nextBids = body.bids ?? [];
+        if (isPoll) {
+          for (const bid of [...nextBids].reverse()) {
+            if (!seenBidIds.has(bid.id)) {
+              seenBidIds.add(bid.id);
+              pushActivity(
+                `Accepted ${formatCurrencyFromCents(bid.amountCents)} from ${bid.bidder.displayName}`
+              );
+            }
+          }
+        } else {
+          seenBidIds = new Set(nextBids.map((bid) => bid.id));
+          setBidAmount((body.auction.minimumBidCents / 100).toFixed(2));
+        }
+        setBids(nextBids);
+        if (!isPoll) setMissing(false);
       } catch (err) {
         if ((err as Error).name === 'AbortError') return;
-        setMissing(true);
+        if (!isPoll) setMissing(true);
       } finally {
-        setLoading(false);
+        if (!isPoll) setLoading(false);
       }
-    })();
-    return () => controller.abort();
+    }
+
+    void loadAuction(false);
+    const poll = window.setInterval(() => void loadAuction(true), 1000);
+    return () => {
+      controller.abort();
+      window.clearInterval(poll);
+    };
   }, [slug]);
 
   if (loading) {
@@ -179,9 +223,11 @@ function ItemPage({ slug }: { slug: string }) {
     );
   }
 
+  const countdown = formatLiveCountdown(auction.closingTime, nowMs);
+  const ended = countdown.ended || auction.ended;
   const isSeller = Boolean(activeUser && activeUser.id === auction.seller.id);
-  const canBid = Boolean(activeUser) && !auction.ended && !isSeller;
-  const bidBlockedReason = auction.ended
+  const canBid = Boolean(activeUser) && !ended && !isSeller;
+  const bidBlockedReason = ended
     ? 'This auction has ended. Bidding is closed.'
     : isSeller
       ? 'You are the seller. Bidding is unavailable on your own auction.'
@@ -200,6 +246,7 @@ function ItemPage({ slug }: { slug: string }) {
       return;
     }
 
+    pushActivity(`Submitting ${formatCurrencyFromCents(amountCents)} as ${activeUser.displayName}`);
     setSubmitting(true);
     try {
       const response = await fetch(`/api/auctions/${encodeURIComponent(auction.slug)}/bids`, {
@@ -215,6 +262,7 @@ function ItemPage({ slug }: { slug: string }) {
       };
       if (!response.ok || !body.auction) {
         setBidError(body.error ?? 'Could not place bid.');
+        pushActivity(`Rejected: ${body.error ?? 'Could not place bid.'}`);
         if (body.minimumBidCents) {
           setBidAmount((body.minimumBidCents / 100).toFixed(2));
         }
@@ -223,8 +271,10 @@ function ItemPage({ slug }: { slug: string }) {
       setAuction(body.auction);
       setBids(body.bids ?? []);
       setBidAmount((body.auction.minimumBidCents / 100).toFixed(2));
+      pushActivity(`Server accepted ${formatCurrencyFromCents(amountCents)}`);
     } catch {
       setBidError('Could not place bid.');
+      pushActivity('Network error while placing bid');
     } finally {
       setSubmitting(false);
     }
@@ -258,8 +308,8 @@ function ItemPage({ slug }: { slug: string }) {
               <strong>{auction.leadingBidder?.displayName ?? '—'}</strong>
             </div>
             <div className="ending">
-              <span>{auction.ended ? 'Auction ended' : 'Auction closes in'}</span>
-              <strong>{auction.timeLeft}</strong>
+              <span>{ended ? 'Auction ended' : 'Auction closes in'}</span>
+              <strong data-testid="auction-countdown">{countdown.label}</strong>
             </div>
             <form className="bid-form" onSubmit={onPlaceBid}>
               <label htmlFor="bid">Your bid</label>
@@ -301,14 +351,19 @@ function ItemPage({ slug }: { slug: string }) {
           <h2>The details</h2>
           <p>{auction.description}</p>
         </section>
-        {auction.specifications.length > 0 ? (
-          <section className="spec-list">
-            <p className="eyebrow">Specifications</p>
-            {auction.specifications.map(([label, value]) => (
-              <div key={label}><span>{label}</span><strong>{value}</strong></div>
-            ))}
-          </section>
-        ) : null}
+        <section className="bid-activity" aria-label="Bidding activity">
+          <p className="eyebrow">Live activity</p>
+          <h2>What just happened</h2>
+          {activity.length === 0 ? (
+            <p className="bid-history-empty">Waiting for bids…</p>
+          ) : (
+            <ul data-testid="bid-activity">
+              {activity.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+          )}
+        </section>
       </div>
       <section className="bid-history" aria-label="Bid history">
         <p className="eyebrow">Bid history</p>
@@ -316,9 +371,9 @@ function ItemPage({ slug }: { slug: string }) {
         {bids.length === 0 ? (
           <p className="bid-history-empty">No bids yet.</p>
         ) : (
-          <ul>
+          <ul data-testid="bid-history-list">
             {bids.map((bid) => (
-              <li key={bid.id}>
+              <li key={bid.id} data-amount-cents={bid.amountCents}>
                 <strong>{bid.bidder.displayName}</strong>
                 <span>{formatCurrencyFromCents(bid.amountCents)}</span>
                 <time dateTime={bid.createdAt}>{new Date(bid.createdAt).toLocaleString()}</time>

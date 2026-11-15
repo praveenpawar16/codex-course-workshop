@@ -300,7 +300,8 @@ export function buildApp() {
     try {
       await client.query('BEGIN');
 
-      const locked = await client.query<{
+      // Intentionally unlocked read → validate → write (Part 3 adds concurrency protection).
+      const selected = await client.query<{
         id: string;
         seller_id: string;
         current_amount_cents: number;
@@ -308,11 +309,10 @@ export function buildApp() {
       }>(
         `SELECT id, seller_id, current_amount_cents, closing_time
          FROM auctions
-         WHERE slug = $1
-         FOR UPDATE`,
+         WHERE slug = $1`,
         [request.params.slug]
       );
-      const auction = locked.rows[0];
+      const auction = selected.rows[0];
       if (!auction) {
         await client.query('ROLLBACK');
         return reply.code(404).send({ error: 'Auction not found' });
@@ -344,6 +344,14 @@ export function buildApp() {
           error: `Bid must be at least $1.00 above the current amount (minimum ${minimumBidCents} cents)`,
           minimumBidCents,
         });
+      }
+
+      // Widen the race window only for Bidding War demo auctions (slug prefix).
+      if (request.params.slug.startsWith('bidding-war')) {
+        const delayMs = Number(process.env.BID_RACE_DELAY_MS ?? '300');
+        if (Number.isFinite(delayMs) && delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
       }
 
       const bidId = randomUUID();
