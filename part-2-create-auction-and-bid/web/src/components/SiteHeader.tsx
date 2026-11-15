@@ -18,9 +18,12 @@ export function SiteHeader() {
         <span className="header-note">
           <span className="live-dot" /> Six live auctions · New finds every week
         </span>
-        <div className="header-active-user" aria-label="Active demo user">
-          <span className="header-active-user-label">Signed in as</span>
-          <strong>{activeLabel}</strong>
+        <div className="header-actions">
+          <a className="header-sell" href="/auctions/new">Sell</a>
+          <div className="header-active-user" aria-label="Active demo user">
+            <span className="header-active-user-label">Signed in as</span>
+            <strong>{activeLabel}</strong>
+          </div>
         </div>
       </div>
     </header>

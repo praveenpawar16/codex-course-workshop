@@ -5,14 +5,14 @@ import { ProductArt } from './ProductArt';
 export function ProductCard({ auction }: { auction: Auction }) {
   return (
     <article className="product-card">
-      <a className="product-image-link" href={`/items/${auction.slug}`}>
+      <a className="product-image-link" href={`/auctions/${auction.slug}`}>
         <ProductArt kind={auction.art} label={`Illustration of ${auction.title}`} />
         <span className="time-pill">{auction.timeLeft} left</span>
       </a>
       <div className="product-card-body">
         <p className="product-category">{auction.category}</p>
         <h3>
-          <a href={`/items/${auction.slug}`}>{auction.title}</a>
+          <a href={`/auctions/${auction.slug}`}>{auction.title}</a>
         </h3>
         <p className="product-kicker">{auction.kicker}</p>
         <div className="price-row">

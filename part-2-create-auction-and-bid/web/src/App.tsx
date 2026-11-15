@@ -6,6 +6,7 @@ import { ProductArt } from './components/ProductArt';
 import { ProductCard } from './components/ProductCard';
 import { SiteHeader } from './components/SiteHeader';
 import { UserSwitcher } from './components/UserSwitcher';
+import { NewAuctionPage } from './pages/NewAuctionPage';
 import type { Auction } from './types';
 import { formatCurrencyFromCents } from './types';
 
@@ -263,12 +264,24 @@ function AppShell() {
   }, [theme]);
 
   useEffect(() => {
-    document.title = path.startsWith('/items/') ? 'Auction · Auction House' : 'Auction House';
+    const isDetail = path.startsWith('/items/') || (path.startsWith('/auctions/') && path !== '/auctions/new');
+    document.title = path === '/auctions/new'
+      ? 'Sell · Auction House'
+      : isDetail
+        ? 'Auction · Auction House'
+        : 'Auction House';
   }, [path]);
 
-  const page = path.startsWith('/items/')
-    ? <ItemPage slug={decodeURIComponent(path.slice('/items/'.length))} />
-    : <HomePage theme={theme} onThemeChange={setTheme} />;
+  let page;
+  if (path === '/auctions/new') {
+    page = <NewAuctionPage />;
+  } else if (path.startsWith('/auctions/')) {
+    page = <ItemPage slug={decodeURIComponent(path.slice('/auctions/'.length))} />;
+  } else if (path.startsWith('/items/')) {
+    page = <ItemPage slug={decodeURIComponent(path.slice('/items/'.length))} />;
+  } else {
+    page = <HomePage theme={theme} onThemeChange={setTheme} />;
+  }
 
   return (
     <div className="app-shell" data-theme={theme}>

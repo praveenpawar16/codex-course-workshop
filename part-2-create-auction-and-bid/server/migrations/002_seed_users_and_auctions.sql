@@ -1,15 +1,15 @@
 -- Fixed ids so an explicit db:reset restores the same seed rows.
 INSERT INTO users (id, handle, display_name) VALUES
-  ('11111111-1111-1111-1111-111111111101', 'tensor_tamer', 'Tensor Tamer'),
-  ('11111111-1111-1111-1111-111111111102', 'thread_ripper_47', 'Thread Ripper'),
-  ('11111111-1111-1111-1111-111111111103', 'segfault_sally', 'Segfault Sally'),
-  ('11111111-1111-1111-1111-111111111104', 'four_u_and_me', 'Four U and Me'),
-  ('11111111-1111-1111-1111-111111111105', 'packet_wrangler', 'Packet Wrangler'),
-  ('11111111-1111-1111-1111-111111111106', 'thermal_throttler', 'Thermal Throttler'),
-  ('11111111-1111-1111-1111-111111111107', 'north_loop', 'North Loop Compute'),
-  ('11111111-1111-1111-1111-111111111108', 'decom_dreams', 'Decommissioned Dreams'),
-  ('11111111-1111-1111-1111-111111111109', 'heap_and_sons', 'Heap & Sons'),
-  ('11111111-1111-1111-1111-111111111110', 'cool_story', 'Cool Story Systems');
+  ('11111111-1111-4111-a111-111111111101', 'tensor_tamer', 'Tensor Tamer'),
+  ('11111111-1111-4111-a111-111111111102', 'thread_ripper_47', 'Thread Ripper'),
+  ('11111111-1111-4111-a111-111111111103', 'segfault_sally', 'Segfault Sally'),
+  ('11111111-1111-4111-a111-111111111104', 'four_u_and_me', 'Four U and Me'),
+  ('11111111-1111-4111-a111-111111111105', 'packet_wrangler', 'Packet Wrangler'),
+  ('11111111-1111-4111-a111-111111111106', 'thermal_throttler', 'Thermal Throttler'),
+  ('11111111-1111-4111-a111-111111111107', 'north_loop', 'North Loop Compute'),
+  ('11111111-1111-4111-a111-111111111108', 'decom_dreams', 'Decommissioned Dreams'),
+  ('11111111-1111-4111-a111-111111111109', 'heap_and_sons', 'Heap & Sons'),
+  ('11111111-1111-4111-a111-111111111110', 'cool_story', 'Cool Story Systems');
 
 INSERT INTO auctions (
   id, slug, title, kicker, category, art, description, condition, location,
@@ -17,7 +17,7 @@ INSERT INTO auctions (
   closing_time, specifications
 ) VALUES
 (
-  '22222222-2222-2222-2222-222222222201',
+  '22222222-2222-4222-a222-222222222201',
   'nvidia-h100-sxm-80gb',
   'NVIDIA H100 SXM 80GB',
   'Retired from a very serious rack',
@@ -29,13 +29,13 @@ INSERT INTO auctions (
   1500000,
   1845000,
   22,
-  '11111111-1111-1111-1111-111111111101',
-  '11111111-1111-1111-1111-111111111107',
+  '11111111-1111-4111-a111-111111111101',
+  '11111111-1111-4111-a111-111111111107',
   now() + interval '2 hours 14 minutes',
   '[["Memory","80GB HBM3"],["Interface","SXM5"],["TDP","700W"],["Included","Protective carrier"]]'::jsonb
 ),
 (
-  '22222222-2222-2222-2222-222222222202',
+  '22222222-2222-4222-a222-222222222202',
   'amd-epyc-9654',
   'AMD EPYC 9654 · 96 cores',
   'Has seen things. Mostly Kubernetes.',
@@ -47,13 +47,13 @@ INSERT INTO auctions (
   400000,
   472500,
   14,
-  '11111111-1111-1111-1111-111111111102',
-  '11111111-1111-1111-1111-111111111108',
+  '11111111-1111-4111-a111-111111111102',
+  '11111111-1111-4111-a111-111111111108',
   now() + interval '5 hours 48 minutes',
   '[["Cores / threads","96 / 192"],["Base clock","2.4 GHz"],["Socket","SP5"],["L3 cache","384MB"]]'::jsonb
 ),
 (
-  '22222222-2222-2222-2222-222222222203',
+  '22222222-2222-4222-a222-222222222203',
   'one-point-five-tb-ddr5-ecc',
   '1.5TB DDR5 ECC memory kit',
   'Enough RAM to finally open Chrome',
@@ -65,13 +65,13 @@ INSERT INTO auctions (
   500000,
   689000,
   31,
-  '11111111-1111-1111-1111-111111111103',
-  '11111111-1111-1111-1111-111111111109',
+  '11111111-1111-4111-a111-111111111103',
+  '11111111-1111-4111-a111-111111111109',
   now() + interval '38 minutes',
   '[["Capacity","24 × 64GB"],["Speed","DDR5-4800"],["Type","ECC RDIMM"],["Test result","0 errors / 72 hours"]]'::jsonb
 ),
 (
-  '22222222-2222-2222-2222-222222222204',
+  '22222222-2222-4222-a222-222222222204',
   'supermicro-4u-gpu-chassis',
   'Supermicro 4U GPU chassis',
   'Rack mount, emotionally available',
@@ -83,13 +83,13 @@ INSERT INTO auctions (
   180000,
   212000,
   9,
-  '11111111-1111-1111-1111-111111111104',
-  '11111111-1111-1111-1111-111111111107',
+  '11111111-1111-4111-a111-111111111104',
+  '11111111-1111-4111-a111-111111111107',
   now() + interval '1 day 3 hours',
   '[["GPU capacity","8 × double-width"],["Power","4 × 2,000W"],["Drive bays","24 × 2.5-inch"],["Rails","Included"]]'::jsonb
 ),
 (
-  '22222222-2222-2222-2222-222222222205',
+  '22222222-2222-4222-a222-222222222205',
   'quantum-2-400g-switch',
   'NVIDIA Quantum-2 400Gb switch',
   'Latency has left the chat',
@@ -101,13 +101,13 @@ INSERT INTO auctions (
   1000000,
   1275000,
   18,
-  '11111111-1111-1111-1111-111111111105',
-  '11111111-1111-1111-1111-111111111110',
+  '11111111-1111-4111-a111-111111111105',
+  '11111111-1111-4111-a111-111111111110',
   now() + interval '7 hours 6 minutes',
   '[["Ports","64 × NDR 400Gb/s"],["Throughput","51.2Tb/s"],["Form factor","1U"],["Airflow","Port-to-power"]]'::jsonb
 ),
 (
-  '22222222-2222-2222-2222-222222222206',
+  '22222222-2222-4222-a222-222222222206',
   'direct-to-chip-cooling-loop',
   'Direct-to-chip cooling loop',
   'Please don''t spill it',
@@ -119,8 +119,8 @@ INSERT INTO auctions (
   75000,
   98000,
   7,
-  '11111111-1111-1111-1111-111111111106',
-  '11111111-1111-1111-1111-111111111110',
+  '11111111-1111-4111-a111-111111111106',
+  '11111111-1111-4111-a111-111111111110',
   now() + interval '2 days 11 hours',
   '[["Cold plates","2 × nickel-plated copper"],["Tubing","EPDM, quick disconnect"],["Rated load","1,200W"],["Coolant","Not included"]]'::jsonb
 );

@@ -1,5 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import Fastify from 'fastify';
 import pg from 'pg';
+import { z } from 'zod';
+
+import { artForCategory, CATEGORY_NAMES } from './categories.js';
 
 const connectionString =
   process.env.DATABASE_URL ?? 'postgres://auction:auction@localhost:55432/auction_part_2';
@@ -32,6 +36,19 @@ type AuctionRow = {
   leading_bidder_handle: string | null;
   leading_bidder_display_name: string | null;
 };
+
+const createAuctionSchema = z.object({
+  sellerId: z.string().uuid(),
+  title: z.string().trim().min(1).max(120),
+  category: z.enum(CATEGORY_NAMES),
+  description: z.string().trim().min(1).max(4000),
+  condition: z.string().trim().min(1).max(120),
+  location: z.string().trim().min(1).max(120),
+  startingPriceCents: z.number().int().positive(),
+  closingTime: z
+    .string()
+    .refine((value) => !Number.isNaN(Date.parse(value)), 'Closing time must be a valid timestamp'),
+});
 
 function formatTimeLeft(closingTime: Date, now = new Date()): string {
   const ms = closingTime.getTime() - now.getTime();
@@ -77,6 +94,15 @@ function serializeAuction(row: AuctionRow) {
         }
       : null,
   };
+}
+
+function slugifyTitle(title: string): string {
+  const base = title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  return base.length > 0 ? base : 'auction';
 }
 
 const auctionSelect = `
@@ -128,6 +154,79 @@ export function buildApp() {
       `${auctionSelect} ORDER BY a.closing_time ASC`
     );
     return { auctions: result.rows.map(serializeAuction) };
+  });
+
+  app.post('/api/auctions', async (request, reply) => {
+    const parsed = createAuctionSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: 'Invalid auction',
+        details: parsed.error.flatten(),
+      });
+    }
+
+    const input = parsed.data;
+    const art = artForCategory(input.category);
+    if (!art) {
+      return reply.code(400).send({ error: 'Unknown category' });
+    }
+
+    const closingTime = new Date(input.closingTime);
+    if (!(closingTime.getTime() > Date.now())) {
+      return reply.code(400).send({ error: 'Closing time must be in the future' });
+    }
+
+    const seller = await pool.query<UserRow>(
+      'SELECT id, handle, display_name FROM users WHERE id = $1',
+      [input.sellerId]
+    );
+    if (!seller.rows[0]) {
+      return reply.code(400).send({ error: 'Seller not found' });
+    }
+
+    const id = randomUUID();
+    let slug = slugifyTitle(input.title);
+    const existing = await pool.query<{ slug: string }>(
+      'SELECT slug FROM auctions WHERE slug = $1 OR slug LIKE $2',
+      [slug, `${slug}-%`]
+    );
+    if (existing.rows.some((row) => row.slug === slug)) {
+      slug = `${slug}-${id.slice(0, 8)}`;
+    }
+
+    await pool.query(
+      `INSERT INTO auctions (
+        id, slug, title, kicker, category, art, description, condition, location,
+        starting_price_cents, current_amount_cents, bid_count, leading_bidder_id, seller_id,
+        closing_time, specifications
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9,
+        $10, $10, 0, NULL, $11,
+        $12, '[]'::jsonb
+      )`,
+      [
+        id,
+        slug,
+        input.title,
+        '',
+        input.category,
+        art,
+        input.description,
+        input.condition,
+        input.location,
+        input.startingPriceCents,
+        input.sellerId,
+        closingTime.toISOString(),
+      ]
+    );
+
+    const created = await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [id]);
+    const row = created.rows[0];
+    if (!row) {
+      return reply.code(500).send({ error: 'Auction created but could not be loaded' });
+    }
+
+    return reply.code(201).send({ auction: serializeAuction(row) });
   });
 
   app.get<{ Params: { slug: string } }>('/api/auctions/:slug', async (request, reply) => {
