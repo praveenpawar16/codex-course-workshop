@@ -1,0 +1,8 @@
+# Keep plain `pg` instead of adopting an ORM
+
+Issue [#2](https://github.com/praveenpawar16/codex-course-workshop/issues/2) asks whether replacing application SQL with an ORM would improve safety. We will **not** introduce Drizzle (or another ORM) as the primary data access layer: keep `pg` with parameterized SQL and ordered migrations. Auction correctness already depends on explicit Postgres features that ORMs wrap awkwardly—blocking `SELECT … FOR UPDATE` on bid acceptance ([ADR 0005](./0005-serialize-bids-with-auction-row-lock.md)), `FOR UPDATE SKIP LOCKED` when claiming due auctions, partial unique indexes and `CHECK` constraints for one close / one outbox event / one notification per recipient, and the transactional outbox commit boundary ([ADR 0008](./0008-transactional-outbox-for-auction-close.md)). Safety here comes from those constraints plus Zod at HTTP boundaries, not from hiding SQL. An ORM migration (see deferred [#1](https://github.com/praveenpawar16/codex-course-workshop/issues/1)) would add schema-mapping churn across API, close worker, and notification worker without removing the need for the same lock and uniqueness SQL. Revisit only if a future slice needs a query surface an ORM clearly owns end-to-end without fighting row locks or outbox semantics.
+
+## Considered options
+
+- **Adopt Drizzle (or similar) across services** — rejected for now; forces a large rewrite while still needing raw SQL escapes for locks / `SKIP LOCKED` / partial unique indexes.
+- **Keep plain `pg` + SQL migrations** — accepted; matches the current architecture and the deferred stance on #1.
