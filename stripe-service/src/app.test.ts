@@ -7,7 +7,7 @@ import { buildStripeApp } from './app.js';
 const app = buildStripeApp({ baseUrl: 'http://stripe.test', logger: false });
 
 describe('mock Stripe Checkout', () => {
-  it('creates and retrieves one recognizable open Session per Purchase', async () => {
+  it('creates and retrieves one recognizable Session per Purchase', async () => {
     const purchaseId = crypto.randomUUID();
     const payload = {
       mode: 'payment',
@@ -52,6 +52,7 @@ describe('mock Stripe Checkout', () => {
     expect(hosted.headers['content-type']).toContain('text/html');
     expect(hosted.body).toContain('&lt;script&gt;unsafe&lt;/script&gt;');
     expect(hosted.body).not.toContain('<script>unsafe</script>');
+    expect(hosted.body).toContain('4242 4242 4242 4242');
 
     const declined = await app.inject({ method: 'POST', url: `/v1/checkout/sessions/${session.id}/attempt`, payload: { cardNumber: '4000 0000 0000 0002', expiry: '12 / 30', cvc: '123' } });
     expect(declined.statusCode).toBe(402);
@@ -92,6 +93,24 @@ describe('mock Stripe Checkout', () => {
     expect(JSON.parse(deliveries[0]!.body)).toMatchObject({ eventType: 'checkout.session.completed', data: { object: { id: session.id, payment_status: 'paid', amount_total: 20_000 } } });
     const retrieved = await successApp.inject({ method: 'GET', url: `/v1/checkout/sessions/${session.id}` });
     expect(retrieved.json()).toMatchObject({ status: 'complete', payment_status: 'paid' });
+
+    const replay = await successApp.inject({ method: 'POST', url: `/v1/checkout/sessions/${session.id}/attempt`, payload: { cardNumber: '4242 4242 4242 4242', expiry: '12 / 30', cvc: '123' } });
+    expect(replay.statusCode).toBe(200);
+    expect(deliveries).toHaveLength(1);
+
+    const samePurchase = await successApp.inject({
+      method: 'POST',
+      url: '/v1/checkout/sessions',
+      payload: {
+        mode: 'payment',
+        client_reference_id: purchaseId,
+        line_items: [{ price_data: { currency: 'usd', product_data: { name: 'Paid server' }, unit_amount: 20_000 }, quantity: 1 }],
+        success_url: 'http://marketplace.test/items/server?checkout=success&session_id={CHECKOUT_SESSION_ID}',
+        cancel_url: 'http://marketplace.test/items/server?checkout=canceled',
+      },
+    });
+    expect(samePurchase.statusCode).toBe(200);
+    expect(samePurchase.json().id).toBe(session.id);
     await successApp.close();
   });
 });
