@@ -28,7 +28,8 @@ codex exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
 >   proves the vertical path works. No speculative abstractions, no "we'll need this later"
 >   scaffolding.
 > - Stack: TypeScript + ESM everywhere. React + Vite in `web/`. Fastify in `server/`.
->   PostgreSQL 16 via Docker Compose. Plain `pg` client — NO ORM, no query builder.
+>   PostgreSQL 16 via Docker Compose. Part 6 application queries use Drizzle ORM (`pg` driver);
+>   ordered SQL migrations remain for DDL (issue #1).
 >   Vitest for tests.
 > - npm workspaces monorepo at the folder root: workspaces `server` and `web`.
 > - Infrastructure runs in Docker; the API and web dev server run on the host (host has

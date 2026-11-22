@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { and, asc, count, eq, isNull } from 'drizzle-orm';
 import type pg from 'pg';
 
 import type { AuctionClosedPayload } from './closeAuction.js';
+import { createDb, type Db } from './db/client.js';
+import { closeNotifications } from './db/schema.js';
 
 export type CloseNotificationRole = 'seller' | 'winner';
 
@@ -66,6 +69,10 @@ export function buildNotificationPayload(
   };
 }
 
+function asDb(pool: pg.Pool | pg.PoolClient): Db {
+  return createDb(pool);
+}
+
 /**
  * Ensure one notification row per recipient. Returns rows still needing emit
  * (handles redelivery after insert-but-before-emit crashes).
@@ -74,29 +81,44 @@ export async function ensureCloseNotifications(
   pool: pg.Pool | pg.PoolClient,
   closed: AuctionClosedPayload
 ): Promise<CloseNotificationRecord[]> {
+  const db = asDb(pool);
   const recipients = recipientsForClose(closed);
 
   for (const recipient of recipients) {
     const id = randomUUID();
     const payload = buildNotificationPayload(id, recipient, closed);
-    await pool.query(
-      `INSERT INTO close_notifications (
-         id, auction_id, recipient_user_id, role, payload
-       ) VALUES ($1, $2, $3, $4, $5::jsonb)
-       ON CONFLICT (auction_id, recipient_user_id) DO NOTHING`,
-      [id, closed.auctionId, recipient.userId, recipient.role, JSON.stringify(payload)]
-    );
+    await db
+      .insert(closeNotifications)
+      .values({
+        id,
+        auctionId: closed.auctionId,
+        recipientUserId: recipient.userId,
+        role: recipient.role,
+        payload,
+      })
+      .onConflictDoNothing({
+        target: [closeNotifications.auctionId, closeNotifications.recipientUserId],
+      });
   }
 
-  const pending = await pool.query<CloseNotificationRecord>(
-    `SELECT id, auction_id, recipient_user_id, role, payload, created_at, emitted_at, dismissed_at
-     FROM close_notifications
-     WHERE auction_id = $1
-       AND emitted_at IS NULL
-     ORDER BY created_at ASC`,
-    [closed.auctionId]
-  );
-  return pending.rows;
+  const pending = await db
+    .select()
+    .from(closeNotifications)
+    .where(
+      and(eq(closeNotifications.auctionId, closed.auctionId), isNull(closeNotifications.emittedAt))
+    )
+    .orderBy(asc(closeNotifications.createdAt));
+
+  return pending.map((row) => ({
+    id: row.id,
+    auction_id: row.auctionId,
+    recipient_user_id: row.recipientUserId,
+    role: row.role as CloseNotificationRole,
+    payload: row.payload as CloseNotificationPayload,
+    created_at: row.createdAt,
+    emitted_at: row.emittedAt,
+    dismissed_at: row.dismissedAt,
+  }));
 }
 
 export async function markCloseNotificationEmitted(
@@ -104,29 +126,43 @@ export async function markCloseNotificationEmitted(
   notificationId: string,
   emittedAt: Date = new Date()
 ): Promise<boolean> {
-  const result = await pool.query(
-    `UPDATE close_notifications
-     SET emitted_at = $2
-     WHERE id = $1
-       AND emitted_at IS NULL`,
-    [notificationId, emittedAt.toISOString()]
-  );
-  return result.rowCount === 1;
+  const db = asDb(pool);
+  const updated = await db
+    .update(closeNotifications)
+    .set({ emittedAt })
+    .where(
+      and(eq(closeNotifications.id, notificationId), isNull(closeNotifications.emittedAt))
+    )
+    .returning({ id: closeNotifications.id });
+  return updated.length === 1;
 }
 
 export async function listUndismissedCloseNotifications(
   pool: pg.Pool | pg.PoolClient,
   recipientUserId: string
 ): Promise<CloseNotificationRecord[]> {
-  const result = await pool.query<CloseNotificationRecord>(
-    `SELECT id, auction_id, recipient_user_id, role, payload, created_at, emitted_at, dismissed_at
-     FROM close_notifications
-     WHERE recipient_user_id = $1
-       AND dismissed_at IS NULL
-     ORDER BY created_at ASC`,
-    [recipientUserId]
-  );
-  return result.rows;
+  const db = asDb(pool);
+  const rows = await db
+    .select()
+    .from(closeNotifications)
+    .where(
+      and(
+        eq(closeNotifications.recipientUserId, recipientUserId),
+        isNull(closeNotifications.dismissedAt)
+      )
+    )
+    .orderBy(asc(closeNotifications.createdAt));
+
+  return rows.map((row) => ({
+    id: row.id,
+    auction_id: row.auctionId,
+    recipient_user_id: row.recipientUserId,
+    role: row.role as CloseNotificationRole,
+    payload: row.payload as CloseNotificationPayload,
+    created_at: row.createdAt,
+    emitted_at: row.emittedAt,
+    dismissed_at: row.dismissedAt,
+  }));
 }
 
 export async function dismissCloseNotification(
@@ -135,15 +171,19 @@ export async function dismissCloseNotification(
   recipientUserId: string,
   dismissedAt: Date = new Date()
 ): Promise<boolean> {
-  const result = await pool.query(
-    `UPDATE close_notifications
-     SET dismissed_at = $3
-     WHERE id = $1
-       AND recipient_user_id = $2
-       AND dismissed_at IS NULL`,
-    [notificationId, recipientUserId, dismissedAt.toISOString()]
-  );
-  return result.rowCount === 1;
+  const db = asDb(pool);
+  const updated = await db
+    .update(closeNotifications)
+    .set({ dismissedAt })
+    .where(
+      and(
+        eq(closeNotifications.id, notificationId),
+        eq(closeNotifications.recipientUserId, recipientUserId),
+        isNull(closeNotifications.dismissedAt)
+      )
+    )
+    .returning({ id: closeNotifications.id });
+  return updated.length === 1;
 }
 
 export type DeliverCloseNotificationsResult = {
@@ -161,6 +201,7 @@ export async function deliverCloseNotifications(
   closed: AuctionClosedPayload,
   emit: (payload: CloseNotificationPayload) => Promise<void>
 ): Promise<DeliverCloseNotificationsResult> {
+  const db = asDb(pool);
   const recipients = recipientsForClose(closed);
   const pendingBefore = await ensureCloseNotifications(pool, closed);
   const emitted: CloseNotificationPayload[] = [];
@@ -174,11 +215,12 @@ export async function deliverCloseNotifications(
     }
   }
 
-  const all = await pool.query<{ count: number }>(
-    `SELECT count(*)::int AS count FROM close_notifications WHERE auction_id = $1`,
-    [closed.auctionId]
-  );
-  const skippedAlreadyEmitted = Math.max(0, (all.rows[0]?.count ?? 0) - emitted.length);
+  const [{ value: total = 0 } = { value: 0 }] = await db
+    .select({ value: count() })
+    .from(closeNotifications)
+    .where(eq(closeNotifications.auctionId, closed.auctionId));
+
+  const skippedAlreadyEmitted = Math.max(0, Number(total) - emitted.length);
 
   return { recipients, emitted, skippedAlreadyEmitted };
 }

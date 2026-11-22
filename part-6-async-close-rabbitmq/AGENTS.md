@@ -3,13 +3,16 @@
 - `server/` contains the Fastify API, Socket.IO realtime transport, PostgreSQL migrations,
   the Auction Close Worker (`src/closeWorker.ts`), and the Notification Worker
   (`src/notificationWorker.ts`).
+- Application database access uses **Drizzle ORM** (`drizzle-orm` + `pg`) via
+  `server/src/db/`. Ordered SQL files under `server/migrations/` remain the DDL source.
 - `web/` contains the React + Vite UI.
 - PostgreSQL is shared from `../docker-compose.yml`; this part uses `auction_part_6` on
   host port 55432. Redis and RabbitMQ are part-local via `./docker-compose.yml`
   (`127.0.0.1:6306` Redis, `127.0.0.1:5606` / UI `15606` RabbitMQ). The API runs on 3106
   and the web app on 5106.
 - Read `CONTEXT.md` and `GRILL.md` before changing close/notification workflow or realtime.
-- Preserve Part 3 concurrency protection (`SELECT … FOR UPDATE`); emit bid fan-out only after commit.
+- Preserve Part 3 concurrency protection (`SELECT … FOR UPDATE` via Drizzle `.for('update')`);
+  emit bid fan-out only after commit.
 - Baseline is Part 4 (realtime). Do not pull Part 5 — it contains a deliberate defect.
 
 Stable root commands: `npm run db:up`, `npm run db:down`, `npm run db:reset`,

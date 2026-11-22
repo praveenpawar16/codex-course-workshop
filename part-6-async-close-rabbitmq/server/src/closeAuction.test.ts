@@ -247,13 +247,26 @@ describe('closeDueAuctions', () => {
     });
 
     await closeDueAuctions(pool, { now: () => new Date() });
-    await expect(
-      pool.query(
-        `INSERT INTO auction_close_outbox (id, auction_id, event_type, payload)
-         VALUES ($1, $2, $3, '{}'::jsonb)`,
-        [randomUUID(), id, AUCTION_CLOSED_EVENT]
-      )
-    ).rejects.toThrow(/unique|duplicate/i);
+    const { createDb } = await import('./db/client.js');
+    const { auctionCloseOutbox } = await import('./db/schema.js');
+    const db = createDb(pool);
+    try {
+      await db.insert(auctionCloseOutbox).values({
+        id: randomUUID(),
+        auctionId: id,
+        eventType: AUCTION_CLOSED_EVENT,
+        payload: {},
+      });
+      expect.unreachable('expected unique violation');
+    } catch (error) {
+      const cause = error instanceof Error && 'cause' in error ? error.cause : error;
+      const message = cause instanceof Error ? cause.message : String(cause ?? error);
+      const code =
+        cause && typeof cause === 'object' && 'code' in cause
+          ? String((cause as { code: unknown }).code)
+          : '';
+      expect(code === '23505' || /unique|duplicate/i.test(message)).toBe(true);
+    }
   });
 });
 
