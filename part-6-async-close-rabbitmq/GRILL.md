@@ -25,7 +25,7 @@ Agreed decisions from the design conversation. Glossary: [`CONTEXT.md`](./CONTEX
 - Database `auction_part_6` on host port `55432`
 - API `3106`, web `5106`
 - Redis / RabbitMQ host ports finalized with part-local Compose during implementation (README targets: Redis `6306`, RabbitMQ `5606` / UI `15606`)
-- Plain `pg` + ordered SQL migrations
+- Drizzle ORM (`drizzle-orm` + `pg`) for application queries; ordered SQL migrations for DDL
 - Exclude `node_modules` and generated output from the Part 4 copy
 
 ## Architecture

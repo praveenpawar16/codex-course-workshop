@@ -2,7 +2,7 @@
 
 You will be asked to work within a specific directory (usually numbered 1-8, corresponding with the part- directories in this repo) - if you're not, please clarify where you should work from.
 
-- Stay within the core stack: TypeScript, PostgreSQL, Docker Compose, Fastify, Zod, and React/Vite. Prefer existing libraries and patterns over adding new frameworks.
+- Stay within the core stack: TypeScript, PostgreSQL, Docker Compose, Fastify, Zod, and React/Vite. Prefer existing libraries and patterns over adding new frameworks. Part 6 uses Drizzle ORM for application SQL (issue #1); other parts may still use plain `pg` until migrated.
 - Keep each part self-contained and scope changes to the requested directory. The requested directory may also have an AGENTS.md file in there - be sure to read it. If there is a CONTEXT.md file in it, read that as well.
 - Use strict types, validate inputs at system boundaries, and keep database changes in explicit migrations.
 - Run tests after making changes. The specific tests that will be run should be part of the directory's AGENTS.md file.

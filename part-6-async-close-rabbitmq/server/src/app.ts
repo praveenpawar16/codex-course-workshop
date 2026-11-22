@@ -1,9 +1,13 @@
 import { randomUUID } from 'node:crypto';
+import { and, asc, desc, eq, like, or, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import Fastify from 'fastify';
 import pg from 'pg';
 import { z } from 'zod';
 
 import { artForCategory, CATEGORY_NAMES } from './categories.js';
+import { createDb } from './db/client.js';
+import { auctions, bids, users } from './db/schema.js';
 import {
   dismissCloseNotification,
   listUndismissedCloseNotifications,
@@ -17,13 +21,7 @@ const MIN_INCREMENT_CENTS = 100;
 export type PublishAuctionChanged = (auctionSlug: string) => void | Promise<void>;
 export type RedisHealthCheck = () => Promise<boolean>;
 
-type UserRow = {
-  id: string;
-  handle: string;
-  display_name: string;
-};
-
-type AuctionRow = {
+type AuctionView = {
   id: string;
   slug: string;
   title: string;
@@ -33,31 +31,22 @@ type AuctionRow = {
   description: string;
   condition: string;
   location: string;
-  starting_price_cents: number;
-  current_amount_cents: number;
-  bid_count: number;
-  closing_time: Date;
-  closed_at: Date | null;
-  winner_id: string | null;
-  winning_amount_cents: number | null;
+  startingPriceCents: number;
+  currentAmountCents: number;
+  bidCount: number;
+  closingTime: Date;
+  closedAt: Date | null;
+  winnerId: string | null;
+  winningAmountCents: number | null;
   specifications: Array<[string, string]>;
-  seller_id: string;
-  seller_handle: string;
-  seller_display_name: string;
-  leading_bidder_id: string | null;
-  leading_bidder_handle: string | null;
-  leading_bidder_display_name: string | null;
-  winner_handle: string | null;
-  winner_display_name: string | null;
-};
-
-type BidRow = {
-  id: string;
-  amount_cents: number;
-  created_at: Date;
-  bidder_id: string;
-  bidder_handle: string;
-  bidder_display_name: string;
+  sellerId: string;
+  sellerHandle: string;
+  sellerDisplayName: string;
+  leadingBidderId: string | null;
+  leadingBidderHandle: string | null;
+  leadingBidderDisplayName: string | null;
+  winnerHandle: string | null;
+  winnerDisplayName: string | null;
 };
 
 const createAuctionSchema = z.object({
@@ -98,15 +87,11 @@ function formatTimeLeft(closingTime: Date, now: Date): string {
   return `${minutes}m`;
 }
 
-function serializeAuction(row: AuctionRow, now: Date) {
-  const closingTime = new Date(row.closing_time);
-  const closedAt = row.closed_at ? new Date(row.closed_at) : null;
+function serializeAuction(row: AuctionView, now: Date) {
+  const closingTime = new Date(row.closingTime);
+  const closedAt = row.closedAt ? new Date(row.closedAt) : null;
   const closed = closedAt !== null;
-  const outcome = !closed
-    ? null
-    : row.winner_id
-      ? ('sold' as const)
-      : ('unsold' as const);
+  const outcome = !closed ? null : row.winnerId ? ('sold' as const) : ('unsold' as const);
   return {
     id: row.id,
     slug: row.slug,
@@ -117,50 +102,37 @@ function serializeAuction(row: AuctionRow, now: Date) {
     description: row.description,
     condition: row.condition,
     location: row.location,
-    startingPriceCents: row.starting_price_cents,
-    currentAmountCents: row.current_amount_cents,
-    bidCount: row.bid_count,
+    startingPriceCents: row.startingPriceCents,
+    currentAmountCents: row.currentAmountCents,
+    bidCount: row.bidCount,
     closingTime: closingTime.toISOString(),
     timeLeft: formatTimeLeft(closingTime, now),
     ended: closingTime.getTime() <= now.getTime(),
     closed,
     closedAt: closedAt ? closedAt.toISOString() : null,
     outcome,
-    winningAmountCents: row.winning_amount_cents,
-    minimumBidCents: row.current_amount_cents + MIN_INCREMENT_CENTS,
+    winningAmountCents: row.winningAmountCents,
+    minimumBidCents: row.currentAmountCents + MIN_INCREMENT_CENTS,
     specifications: row.specifications ?? [],
     seller: {
-      id: row.seller_id,
-      handle: row.seller_handle,
-      displayName: row.seller_display_name,
+      id: row.sellerId,
+      handle: row.sellerHandle,
+      displayName: row.sellerDisplayName,
     },
-    leadingBidder: row.leading_bidder_id
+    leadingBidder: row.leadingBidderId
       ? {
-          id: row.leading_bidder_id,
-          handle: row.leading_bidder_handle,
-          displayName: row.leading_bidder_display_name,
+          id: row.leadingBidderId,
+          handle: row.leadingBidderHandle!,
+          displayName: row.leadingBidderDisplayName!,
         }
       : null,
-    winner: row.winner_id
+    winner: row.winnerId
       ? {
-          id: row.winner_id,
-          handle: row.winner_handle!,
-          displayName: row.winner_display_name!,
+          id: row.winnerId,
+          handle: row.winnerHandle!,
+          displayName: row.winnerDisplayName!,
         }
       : null,
-  };
-}
-
-function serializeBid(row: BidRow) {
-  return {
-    id: row.id,
-    amountCents: row.amount_cents,
-    createdAt: new Date(row.created_at).toISOString(),
-    bidder: {
-      id: row.bidder_id,
-      handle: row.bidder_handle,
-      displayName: row.bidder_display_name,
-    },
   };
 }
 
@@ -173,35 +145,70 @@ function slugifyTitle(title: string): string {
   return base.length > 0 ? base : 'auction';
 }
 
-const auctionSelect = `
-  SELECT
-    a.id, a.slug, a.title, a.kicker, a.category, a.art, a.description, a.condition, a.location,
-    a.starting_price_cents, a.current_amount_cents, a.bid_count, a.closing_time, a.specifications,
-    a.closed_at, a.winner_id, a.winning_amount_cents,
-    a.seller_id, seller.handle AS seller_handle, seller.display_name AS seller_display_name,
-    a.leading_bidder_id,
-    leader.handle AS leading_bidder_handle,
-    leader.display_name AS leading_bidder_display_name,
-    winner.handle AS winner_handle,
-    winner.display_name AS winner_display_name
-  FROM auctions a
-  JOIN users seller ON seller.id = a.seller_id
-  LEFT JOIN users leader ON leader.id = a.leading_bidder_id
-  LEFT JOIN users winner ON winner.id = a.winner_id
-`;
+const sellerUsers = alias(users, 'seller');
+const leaderUsers = alias(users, 'leader');
+const winnerUsers = alias(users, 'winner');
 
-async function loadBids(pool: pg.Pool | pg.PoolClient, auctionId: string) {
-  const result = await pool.query<BidRow>(
-    `SELECT
-      b.id, b.amount_cents, b.created_at,
-      b.bidder_id, u.handle AS bidder_handle, u.display_name AS bidder_display_name
-    FROM bids b
-    JOIN users u ON u.id = b.bidder_id
-    WHERE b.auction_id = $1
-    ORDER BY b.created_at DESC, b.amount_cents DESC`,
-    [auctionId]
-  );
-  return result.rows.map(serializeBid);
+function auctionSelect(db: ReturnType<typeof createDb>) {
+  return db
+    .select({
+      id: auctions.id,
+      slug: auctions.slug,
+      title: auctions.title,
+      kicker: auctions.kicker,
+      category: auctions.category,
+      art: auctions.art,
+      description: auctions.description,
+      condition: auctions.condition,
+      location: auctions.location,
+      startingPriceCents: auctions.startingPriceCents,
+      currentAmountCents: auctions.currentAmountCents,
+      bidCount: auctions.bidCount,
+      closingTime: auctions.closingTime,
+      closedAt: auctions.closedAt,
+      winnerId: auctions.winnerId,
+      winningAmountCents: auctions.winningAmountCents,
+      specifications: auctions.specifications,
+      sellerId: auctions.sellerId,
+      sellerHandle: sellerUsers.handle,
+      sellerDisplayName: sellerUsers.displayName,
+      leadingBidderId: auctions.leadingBidderId,
+      leadingBidderHandle: leaderUsers.handle,
+      leadingBidderDisplayName: leaderUsers.displayName,
+      winnerHandle: winnerUsers.handle,
+      winnerDisplayName: winnerUsers.displayName,
+    })
+    .from(auctions)
+    .innerJoin(sellerUsers, eq(sellerUsers.id, auctions.sellerId))
+    .leftJoin(leaderUsers, eq(leaderUsers.id, auctions.leadingBidderId))
+    .leftJoin(winnerUsers, eq(winnerUsers.id, auctions.winnerId));
+}
+
+async function loadBids(db: ReturnType<typeof createDb>, auctionId: string) {
+  const rows = await db
+    .select({
+      id: bids.id,
+      amountCents: bids.amountCents,
+      createdAt: bids.createdAt,
+      bidderId: bids.bidderId,
+      bidderHandle: users.handle,
+      bidderDisplayName: users.displayName,
+    })
+    .from(bids)
+    .innerJoin(users, eq(users.id, bids.bidderId))
+    .where(eq(bids.auctionId, auctionId))
+    .orderBy(desc(bids.createdAt), desc(bids.amountCents));
+
+  return rows.map((row) => ({
+    id: row.id,
+    amountCents: row.amountCents,
+    createdAt: new Date(row.createdAt).toISOString(),
+    bidder: {
+      id: row.bidderId,
+      handle: row.bidderHandle,
+      displayName: row.bidderDisplayName,
+    },
+  }));
 }
 
 export function buildApp(options: BuildAppOptions = {}) {
@@ -211,17 +218,18 @@ export function buildApp(options: BuildAppOptions = {}) {
   const checkRedis: RedisHealthCheck = options.checkRedis ?? (async () => true);
   const app = Fastify({ logger: true, requestIdHeader: 'x-request-id' });
   const pool = new pg.Pool({ connectionString, connectionTimeoutMillis: 1000 });
+  const db = createDb(pool);
 
   app.addHook('onRequest', async (request, reply) => {
     reply.header('x-request-id', request.id);
   });
 
   app.get('/api/health', async (request, reply) => {
-    let db: 'ok' | 'down' = 'down';
+    let database: 'ok' | 'down' = 'down';
     let redis: 'ok' | 'down' = 'down';
     try {
-      await pool.query('SELECT 1');
-      db = 'ok';
+      await db.execute(sql`select 1`);
+      database = 'ok';
     } catch (error) {
       request.log.error({ err: error }, 'database health check failed');
     }
@@ -231,32 +239,33 @@ export function buildApp(options: BuildAppOptions = {}) {
       request.log.error({ err: error }, 'redis health check failed');
       redis = 'down';
     }
-    if (db !== 'ok' || redis !== 'ok') {
-      return reply.code(503).send({ ok: false, db, redis, requestId: request.id });
+    if (database !== 'ok' || redis !== 'ok') {
+      return reply.code(503).send({ ok: false, db: database, redis, requestId: request.id });
     }
-    return { ok: true, db, redis, requestId: request.id };
+    return { ok: true, db: database, redis, requestId: request.id };
   });
 
   app.get('/api/users', async () => {
-    const result = await pool.query<UserRow>(
-      'SELECT id, handle, display_name FROM users ORDER BY display_name ASC'
-    );
-    return {
-      users: result.rows.map((row) => ({
-        id: row.id,
-        handle: row.handle,
-        displayName: row.display_name,
-      })),
-    };
+    const rows = await db
+      .select({
+        id: users.id,
+        handle: users.handle,
+        displayName: users.displayName,
+      })
+      .from(users)
+      .orderBy(asc(users.displayName));
+    return { users: rows };
   });
 
   app.get<{ Params: { userId: string } }>(
     '/api/users/:userId/close-notifications',
     async (request, reply) => {
-      const user = await pool.query<UserRow>('SELECT id FROM users WHERE id = $1', [
-        request.params.userId,
-      ]);
-      if (!user.rows[0]) {
+      const [user] = await db
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, request.params.userId))
+        .limit(1);
+      if (!user) {
         return reply.code(404).send({ error: 'User not found' });
       }
       const rows = await listUndismissedCloseNotifications(pool, request.params.userId);
@@ -274,9 +283,7 @@ export function buildApp(options: BuildAppOptions = {}) {
   app.post<{ Params: { id: string } }>(
     '/api/close-notifications/:id/dismiss',
     async (request, reply) => {
-      const body = z
-        .object({ userId: z.string().uuid() })
-        .safeParse(request.body);
+      const body = z.object({ userId: z.string().uuid() }).safeParse(request.body);
       if (!body.success) {
         return reply.code(400).send({ error: 'Invalid dismiss request' });
       }
@@ -294,10 +301,8 @@ export function buildApp(options: BuildAppOptions = {}) {
 
   app.get('/api/auctions', async () => {
     const at = now();
-    const result = await pool.query<AuctionRow>(
-      `${auctionSelect} ORDER BY a.closing_time ASC`
-    );
-    return { auctions: result.rows.map((row) => serializeAuction(row, at)) };
+    const rows = await auctionSelect(db).orderBy(asc(auctions.closingTime));
+    return { auctions: rows.map((row) => serializeAuction(row as AuctionView, at)) };
   });
 
   app.post('/api/auctions', async (request, reply) => {
@@ -321,70 +326,59 @@ export function buildApp(options: BuildAppOptions = {}) {
       return reply.code(400).send({ error: 'Closing time must be in the future' });
     }
 
-    const seller = await pool.query<UserRow>(
-      'SELECT id, handle, display_name FROM users WHERE id = $1',
-      [input.sellerId]
-    );
-    if (!seller.rows[0]) {
+    const [seller] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.id, input.sellerId))
+      .limit(1);
+    if (!seller) {
       return reply.code(400).send({ error: 'Seller not found' });
     }
 
     const id = randomUUID();
     let slug = slugifyTitle(input.title);
-    const existing = await pool.query<{ slug: string }>(
-      'SELECT slug FROM auctions WHERE slug = $1 OR slug LIKE $2',
-      [slug, `${slug}-%`]
-    );
-    if (existing.rows.some((row) => row.slug === slug)) {
+    const existing = await db
+      .select({ slug: auctions.slug })
+      .from(auctions)
+      .where(or(eq(auctions.slug, slug), like(auctions.slug, `${slug}-%`)));
+    if (existing.some((row) => row.slug === slug)) {
       slug = `${slug}-${id.slice(0, 8)}`;
     }
 
-    await pool.query(
-      `INSERT INTO auctions (
-        id, slug, title, kicker, category, art, description, condition, location,
-        starting_price_cents, current_amount_cents, bid_count, leading_bidder_id, seller_id,
-        closing_time, specifications
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9,
-        $10, $10, 0, NULL, $11,
-        $12, '[]'::jsonb
-      )`,
-      [
-        id,
-        slug,
-        input.title,
-        '',
-        input.category,
-        art,
-        input.description,
-        input.condition,
-        input.location,
-        input.startingPriceCents,
-        input.sellerId,
-        closingTime.toISOString(),
-      ]
-    );
+    await db.insert(auctions).values({
+      id,
+      slug,
+      title: input.title,
+      kicker: '',
+      category: input.category,
+      art,
+      description: input.description,
+      condition: input.condition,
+      location: input.location,
+      startingPriceCents: input.startingPriceCents,
+      currentAmountCents: input.startingPriceCents,
+      bidCount: 0,
+      leadingBidderId: null,
+      sellerId: input.sellerId,
+      closingTime,
+      specifications: [],
+    });
 
-    const created = await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [id]);
-    const row = created.rows[0];
+    const [row] = await auctionSelect(db).where(eq(auctions.id, id)).limit(1);
     if (!row) {
       return reply.code(500).send({ error: 'Auction created but could not be loaded' });
     }
 
-    return reply.code(201).send({ auction: serializeAuction(row, at), bids: [] });
+    return reply.code(201).send({ auction: serializeAuction(row as AuctionView, at), bids: [] });
   });
 
   app.get<{ Params: { slug: string } }>('/api/auctions/:slug', async (request, reply) => {
-    const result = await pool.query<AuctionRow>(
-      `${auctionSelect} WHERE a.slug = $1`,
-      [request.params.slug]
-    );
-    const row = result.rows[0];
+    const [row] = await auctionSelect(db).where(eq(auctions.slug, request.params.slug)).limit(1);
     if (!row) {
       return reply.code(404).send({ error: 'Auction not found' });
     }
-    const bids = await loadBids(pool, row.id);
-    return { auction: serializeAuction(row, now()), bids };
+    const auctionBids = await loadBids(db, row.id);
+    return { auction: serializeAuction(row as AuctionView, now()), bids: auctionBids };
   });
 
   app.post<{ Params: { slug: string } }>('/api/auctions/:slug/bids', async (request, reply) => {
@@ -397,106 +391,131 @@ export function buildApp(options: BuildAppOptions = {}) {
     }
 
     const { bidderId, amountCents } = parsed.data;
-    const client = await pool.connect();
+
+    type BidResult =
+      | { kind: 'not_found' }
+      | { kind: 'ended' }
+      | { kind: 'forbidden' }
+      | { kind: 'bidder_missing' }
+      | {
+          kind: 'too_low';
+          minimumBidCents: number;
+          auctionId: string;
+          acceptedAt: Date;
+        }
+      | { kind: 'accepted'; auctionId: string; acceptedAt: Date };
+
+    let result: BidResult;
     try {
-      await client.query('BEGIN');
+      result = await db.transaction(async (tx): Promise<BidResult> => {
+        // BEGIN → lock auction row → read clock + latest price → validate → insert → COMMIT
+        const [auction] = await tx
+          .select({
+            id: auctions.id,
+            sellerId: auctions.sellerId,
+            currentAmountCents: auctions.currentAmountCents,
+            closingTime: auctions.closingTime,
+            closedAt: auctions.closedAt,
+          })
+          .from(auctions)
+          .where(eq(auctions.slug, request.params.slug))
+          .for('update');
 
-      // BEGIN → lock auction row → read clock + latest price → validate → insert → COMMIT
-      const locked = await client.query<{
-        id: string;
-        seller_id: string;
-        current_amount_cents: number;
-        closing_time: Date;
-        closed_at: Date | null;
-      }>(
-        `SELECT id, seller_id, current_amount_cents, closing_time, closed_at
-         FROM auctions
-         WHERE slug = $1
-         FOR UPDATE`,
-        [request.params.slug]
-      );
-      const auction = locked.rows[0];
-      if (!auction) {
-        await client.query('ROLLBACK');
-        return reply.code(404).send({ error: 'Auction not found' });
-      }
+        if (!auction) {
+          return { kind: 'not_found' };
+        }
 
-      // Single clock reading after the lock drives acceptance and bid timestamp.
-      // Closing time remains the authoritative bidding cutoff; closed_at is the durable outcome.
-      const acceptedAt = now();
-      if (
-        auction.closed_at !== null ||
-        new Date(auction.closing_time).getTime() <= acceptedAt.getTime()
-      ) {
-        await client.query('ROLLBACK');
-        return reply.code(400).send({ error: 'This auction has ended' });
-      }
+        const acceptedAt = now();
+        if (
+          auction.closedAt !== null ||
+          auction.closingTime.getTime() <= acceptedAt.getTime()
+        ) {
+          return { kind: 'ended' };
+        }
 
-      if (auction.seller_id === bidderId) {
-        await client.query('ROLLBACK');
-        return reply.code(403).send({ error: 'Sellers cannot bid on their own auctions' });
-      }
+        if (auction.sellerId === bidderId) {
+          return { kind: 'forbidden' };
+        }
 
-      const bidder = await client.query<UserRow>(
-        'SELECT id, handle, display_name FROM users WHERE id = $1',
-        [bidderId]
-      );
-      if (!bidder.rows[0]) {
-        await client.query('ROLLBACK');
-        return reply.code(400).send({ error: 'Bidder not found' });
-      }
+        const [bidder] = await tx
+          .select({ id: users.id })
+          .from(users)
+          .where(eq(users.id, bidderId))
+          .limit(1);
+        if (!bidder) {
+          return { kind: 'bidder_missing' };
+        }
 
-      const minimumBidCents = auction.current_amount_cents + MIN_INCREMENT_CENTS;
-      if (amountCents < minimumBidCents) {
-        await client.query('ROLLBACK');
-        const latest = await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id]);
-        const row = latest.rows[0];
-        const bids = row ? await loadBids(pool, row.id) : [];
-        return reply.code(400).send({
-          error: `Bid must be at least $1.00 above the current amount (minimum ${minimumBidCents} cents)`,
-          minimumBidCents,
-          auction: row ? serializeAuction(row, acceptedAt) : undefined,
-          bids,
+        const minimumBidCents = auction.currentAmountCents + MIN_INCREMENT_CENTS;
+        if (amountCents < minimumBidCents) {
+          return {
+            kind: 'too_low',
+            minimumBidCents,
+            auctionId: auction.id,
+            acceptedAt,
+          };
+        }
+
+        const bidId = randomUUID();
+        await tx.insert(bids).values({
+          id: bidId,
+          auctionId: auction.id,
+          bidderId,
+          amountCents,
+          createdAt: acceptedAt,
         });
-      }
+        await tx
+          .update(auctions)
+          .set({
+            currentAmountCents: amountCents,
+            bidCount: sql`${auctions.bidCount} + 1`,
+            leadingBidderId: bidderId,
+          })
+          .where(eq(auctions.id, auction.id));
 
-      const bidId = randomUUID();
-      await client.query(
-        `INSERT INTO bids (id, auction_id, bidder_id, amount_cents, created_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [bidId, auction.id, bidderId, amountCents, acceptedAt.toISOString()]
-      );
-      await client.query(
-        `UPDATE auctions
-         SET current_amount_cents = $1,
-             bid_count = bid_count + 1,
-             leading_bidder_id = $2
-         WHERE id = $3`,
-        [amountCents, bidderId, auction.id]
-      );
-
-      await client.query('COMMIT');
-
-      // Fan-out only after commit; failure must not undo the accepted bid.
-      try {
-        await publishAuctionChanged(request.params.slug);
-      } catch (error) {
-        request.log.error({ err: error, slug: request.params.slug }, 'auction-changed publish failed');
-      }
-
-      const updated = await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id]);
-      const row = updated.rows[0];
-      if (!row) {
-        return reply.code(500).send({ error: 'Bid saved but auction could not be reloaded' });
-      }
-      const bids = await loadBids(pool, row.id);
-      return reply.code(201).send({ auction: serializeAuction(row, acceptedAt), bids });
+        return { kind: 'accepted', auctionId: auction.id, acceptedAt };
+      });
     } catch (error) {
-      await client.query('ROLLBACK');
       throw error;
-    } finally {
-      client.release();
     }
+
+    if (result.kind === 'not_found') {
+      return reply.code(404).send({ error: 'Auction not found' });
+    }
+    if (result.kind === 'ended') {
+      return reply.code(400).send({ error: 'This auction has ended' });
+    }
+    if (result.kind === 'forbidden') {
+      return reply.code(403).send({ error: 'Sellers cannot bid on their own auctions' });
+    }
+    if (result.kind === 'bidder_missing') {
+      return reply.code(400).send({ error: 'Bidder not found' });
+    }
+    if (result.kind === 'too_low') {
+      const [row] = await auctionSelect(db).where(eq(auctions.id, result.auctionId)).limit(1);
+      const auctionBids = row ? await loadBids(db, row.id) : [];
+      return reply.code(400).send({
+        error: `Bid must be at least $1.00 above the current amount (minimum ${result.minimumBidCents} cents)`,
+        minimumBidCents: result.minimumBidCents,
+        auction: row ? serializeAuction(row as AuctionView, result.acceptedAt) : undefined,
+        bids: auctionBids,
+      });
+    }
+
+    try {
+      await publishAuctionChanged(request.params.slug);
+    } catch (error) {
+      request.log.error({ err: error, slug: request.params.slug }, 'auction-changed publish failed');
+    }
+
+    const [row] = await auctionSelect(db).where(eq(auctions.id, result.auctionId)).limit(1);
+    if (!row) {
+      return reply.code(500).send({ error: 'Bid saved but auction could not be reloaded' });
+    }
+    const auctionBids = await loadBids(db, row.id);
+    return reply
+      .code(201)
+      .send({ auction: serializeAuction(row as AuctionView, result.acceptedAt), bids: auctionBids });
   });
 
   app.addHook('onClose', async () => pool.end());
