@@ -109,5 +109,5 @@ The Winner-started flow that opens a payment session against the local Stripe-sh
 _Avoid_: Real Stripe account setup, API-key configuration, Buyer (use Winner)
 
 **Payment visibility**:
-Whether a Purchase is Unpaid or Paid, shown only to the Seller and the Winner of that Auction.
+Whether a Purchase is awaiting payment or Paid, shown only to the Seller and the Winner of that Auction. The Seller’s detail view updates when payment lands without requiring a manual refresh.
 _Avoid_: Public payment status, bidder-wide ledger

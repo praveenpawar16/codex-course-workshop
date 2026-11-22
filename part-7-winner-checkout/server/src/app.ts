@@ -567,6 +567,15 @@ export function buildApp(options: BuildAppOptions = {}) {
     if (!result.ok) {
       return reply.code(result.statusCode).send({ error: result.error });
     }
+    // Fan-out so Seller/Winner detail pages refresh Paid without a manual reload.
+    try {
+      await publishAuctionChanged(result.auctionSlug);
+    } catch (error) {
+      request.log.error(
+        { err: error, slug: result.auctionSlug },
+        'auction-changed publish failed after payment webhook'
+      );
+    }
     return { ok: true, purchase: result.purchase, replayed: result.replayed };
   });
 

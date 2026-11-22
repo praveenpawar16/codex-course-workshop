@@ -239,7 +239,7 @@ function signaturesMatch(expected: string, provided: string): boolean {
 }
 
 export type WebhookResult =
-  | { ok: true; purchase: PurchaseView; replayed: boolean }
+  | { ok: true; purchase: PurchaseView; replayed: boolean; auctionSlug: string }
   | { ok: false; statusCode: number; error: string };
 
 export async function applyStripeWebhook(
@@ -276,9 +276,12 @@ export async function applyStripeWebhook(
       [event.eventId]
     );
     if (already.rows[0]) {
-      const purchase = await client.query<PurchaseRow>(
-        `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at
-         FROM purchases WHERE id = $1`,
+      const purchase = await client.query<PurchaseRow & { auction_slug: string }>(
+        `SELECT p.id, p.auction_id, p.winner_id, p.amount_cents, p.status, p.stripe_checkout_session_id,
+                p.paid_at, p.created_at, a.slug AS auction_slug
+         FROM purchases p
+         JOIN auctions a ON a.id = p.auction_id
+         WHERE p.id = $1`,
         [already.rows[0].purchase_id]
       );
       await client.query('COMMIT');
@@ -286,7 +289,12 @@ export async function applyStripeWebhook(
       if (!row) {
         return { ok: false, statusCode: 500, error: 'Webhook event missing purchase' };
       }
-      return { ok: true, purchase: serializePurchase(row), replayed: true };
+      return {
+        ok: true,
+        purchase: serializePurchase(row),
+        replayed: true,
+        auctionSlug: row.auction_slug,
+      };
     }
 
     const locked = await client.query<PurchaseRow>(
@@ -320,13 +328,22 @@ export async function applyStripeWebhook(
       [event.eventId, purchase.id]
     );
 
-    const updated = await client.query<PurchaseRow>(
-      `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at
-       FROM purchases WHERE id = $1`,
+    const updated = await client.query<PurchaseRow & { auction_slug: string }>(
+      `SELECT p.id, p.auction_id, p.winner_id, p.amount_cents, p.status, p.stripe_checkout_session_id,
+              p.paid_at, p.created_at, a.slug AS auction_slug
+       FROM purchases p
+       JOIN auctions a ON a.id = p.auction_id
+       WHERE p.id = $1`,
       [purchase.id]
     );
     await client.query('COMMIT');
-    return { ok: true, purchase: serializePurchase(updated.rows[0]!), replayed: purchase.status === 'paid' };
+    const row = updated.rows[0]!;
+    return {
+      ok: true,
+      purchase: serializePurchase(row),
+      replayed: purchase.status === 'paid',
+      auctionSlug: row.auction_slug,
+    };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

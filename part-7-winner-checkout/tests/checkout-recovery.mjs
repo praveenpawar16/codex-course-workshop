@@ -164,11 +164,11 @@ async function main() {
     await seller.page.waitForSelector('[data-testid="purchase-panel"]');
     await winner.page.waitForSelector('[data-testid="purchase-panel"]');
     const sellerStatus = await seller.page.locator('[data-testid="purchase-status"]').textContent();
-    assert.match(sellerStatus ?? '', /Unpaid/i);
+    assert.match(sellerStatus ?? '', /Awaiting payment/i);
     assert.ok(await seller.page.locator('[data-testid="seller-recovery-hint"]').count());
     assert.equal(await seller.page.locator('[data-testid="complete-purchase"]').count(), 0);
     assert.ok(await winner.page.locator('[data-testid="complete-purchase"]').count());
-    console.log('[checkout-recovery] seller sees Unpaid + recovery hint; winner sees pay CTA');
+    console.log('[checkout-recovery] seller sees Awaiting payment + recovery hint; winner sees pay CTA');
 
     await winner.page.getByTestId('complete-purchase').click();
     await winner.page.waitForURL(/127\.0\.0\.1:7107\/checkout\//, { timeout: 20_000 });
@@ -185,12 +185,12 @@ async function main() {
     await winner.page.waitForFunction(() => {
       return document.querySelector('[data-testid="purchase-status"]')?.textContent?.includes('Paid');
     });
-    await seller.page.reload({ waitUntil: 'domcontentloaded' });
+    // Seller must flip live via auction-changed — no manual reload.
     await seller.page.waitForFunction(() => {
       return document.querySelector('[data-testid="purchase-status"]')?.textContent?.includes('Paid');
-    });
+    }, null, { timeout: 20_000 });
     assert.ok(await seller.page.locator('[data-testid="seller-paid-hint"]').count());
-    console.log('[checkout-recovery] PASS — seller and winner both show Paid');
+    console.log('[checkout-recovery] PASS — seller and winner both show Paid (seller without reload)');
     console.log(`[checkout-recovery] holding windows open for ${HOLD_MS}ms`);
     await sleep(HOLD_MS);
   } finally {
