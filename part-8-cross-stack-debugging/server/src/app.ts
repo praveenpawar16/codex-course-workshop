@@ -4,6 +4,7 @@ import pg from 'pg';
 import { z } from 'zod';
 
 import { artForCategory, CATEGORY_NAMES } from './categories.js';
+import { loadWinningBidTraceContext } from './closeAuction.js';
 import {
   dismissCloseNotification,
   listUndismissedCloseNotifications,
@@ -19,7 +20,9 @@ import {
   unpaidPurchaseFromWinningAmount,
   type PurchaseView,
 } from './purchases.js';
-import { recordBidOutcome } from './tracing.js';
+import { currentTraceparent } from './traceContext.js';
+import { recordBidOutcome, withBidAcceptSpan } from './tracing.js';
+import { isTraceparent, recordBusinessOutcome, withContinuedTrace } from './traceContext.js';
 
 const connectionString =
   process.env.DATABASE_URL ?? 'postgres://auction:auction@localhost:55432/auction_part_8';
@@ -483,67 +486,90 @@ export function buildApp(options: BuildAppOptions = {}) {
           return reply.code(403).send({ error: 'Only the winner may start checkout' });
         }
 
-        const purchase = await getOrCreatePurchase(client, {
-          auctionId: auction.id,
-          winnerId: auction.winner_id,
-          amountCents: auction.winning_amount_cents,
-        });
+        const winnerId = auction.winner_id;
+        const winningAmountCents = auction.winning_amount_cents;
+        const traceContext = await loadWinningBidTraceContext(
+          client,
+          auction.id,
+          winnerId,
+          winningAmountCents
+        );
 
-        if (purchase.status === 'paid') {
-          await client.query('COMMIT');
-          const row = (
-            await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id])
-          ).rows[0]!;
-          return {
-            purchase: serializePurchase(purchase),
-            checkoutUrl: null,
-            auction: serializeAuction(row, now(), serializePurchase(purchase)),
-          };
-        }
-
-        await client.query('COMMIT');
-
-        let session: { id: string; url: string; recovered: boolean };
-        try {
-          session = await resolveCheckoutSession({
-            purchase,
-            title: auction.title,
-            slug: auction.slug,
-            pool,
-          });
-        } catch (error) {
-          const statusCode =
-            error && typeof error === 'object' && 'statusCode' in error
-              ? Number((error as { statusCode: unknown }).statusCode)
-              : 502;
-          return reply
-            .code(Number.isFinite(statusCode) ? statusCode : 502)
-            .send({
-              error: error instanceof Error ? error.message : 'Checkout unavailable',
+        return await withContinuedTrace(
+          traceContext,
+          'auction.checkout',
+          {
+            'auction.slug': auction.slug,
+            'auction.id': auction.id,
+            'bidder.id': winnerId,
+          },
+          async (span) => {
+            const purchase = await getOrCreatePurchase(client, {
+              auctionId: auction.id,
+              winnerId,
+              amountCents: winningAmountCents,
+              traceContext,
             });
-        }
 
-        const rememberClient = await pool.connect();
-        try {
-          await rememberCheckoutSession(rememberClient, purchase.id, session.id);
-        } finally {
-          rememberClient.release();
-        }
+            if (purchase.status === 'paid') {
+              await client.query('COMMIT');
+              recordBusinessOutcome(span, 'already_paid');
+              const row = (
+                await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id])
+              ).rows[0]!;
+              return {
+                purchase: serializePurchase(purchase),
+                checkoutUrl: null,
+                auction: serializeAuction(row, now(), serializePurchase(purchase)),
+              };
+            }
 
-        const row = (
-          await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id])
-        ).rows[0]!;
-        const latestPurchase = await loadPurchaseForAuction(pool, auction.id);
-        return {
-          purchase: serializePurchase(latestPurchase ?? purchase),
-          checkoutUrl: session.url,
-          recovered: session.recovered,
-          auction: serializeAuction(
-            row,
-            now(),
-            latestPurchase ? serializePurchase(latestPurchase) : serializePurchase(purchase)
-          ),
-        };
+            await client.query('COMMIT');
+
+            let session: { id: string; url: string; recovered: boolean };
+            try {
+              session = await resolveCheckoutSession({
+                purchase,
+                title: auction.title,
+                slug: auction.slug,
+                pool,
+              });
+            } catch (error) {
+              const statusCode =
+                error && typeof error === 'object' && 'statusCode' in error
+                  ? Number((error as { statusCode: unknown }).statusCode)
+                  : 502;
+              return reply
+                .code(Number.isFinite(statusCode) ? statusCode : 502)
+                .send({
+                  error: error instanceof Error ? error.message : 'Checkout unavailable',
+                });
+            }
+
+            const rememberClient = await pool.connect();
+            try {
+              await rememberCheckoutSession(rememberClient, purchase.id, session.id);
+            } finally {
+              rememberClient.release();
+            }
+
+            const row = (
+              await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id])
+            ).rows[0]!;
+            const latestPurchase = await loadPurchaseForAuction(pool, auction.id);
+            recordBusinessOutcome(span, session.recovered ? 'session_recovered' : 'session_created');
+            return {
+              purchase: serializePurchase(latestPurchase ?? purchase),
+              checkoutUrl: session.url,
+              recovered: session.recovered,
+              auction: serializeAuction(
+                row,
+                now(),
+                latestPurchase ? serializePurchase(latestPurchase) : serializePurchase(purchase)
+              ),
+            };
+          }
+        );
       } catch (error) {
         await client.query('ROLLBACK');
         if (error && typeof error === 'object' && 'statusCode' in error) {
@@ -564,18 +590,37 @@ export function buildApp(options: BuildAppOptions = {}) {
       typeof request.headers['x-stripe-signature'] === 'string'
         ? request.headers['x-stripe-signature']
         : undefined;
-    const result = await applyStripeWebhook(pool, rawBody, signature);
+    // HTTP client instrumentation may add a second traceparent; Node joins duplicates with ", ".
+    const traceparentHeader = request.headers['traceparent'];
+    const webhookTraceparent =
+      typeof traceparentHeader === 'string'
+        ? traceparentHeader
+            .split(',')
+            .map((part) => part.trim())
+            .find((part) => isTraceparent(part))
+        : undefined;
+    const result = await applyStripeWebhook(pool, rawBody, signature, {
+      traceparent: webhookTraceparent,
+    });
     if (!result.ok) {
       return reply.code(result.statusCode).send({ error: result.error });
+    }
+    // Fan-out so Seller/Winner detail pages refresh Paid without a manual reload.
+    try {
+      await publishAuctionChanged(result.auctionSlug);
+    } catch (error) {
+      request.log.error(
+        { err: error, slug: result.auctionSlug },
+        'auction-changed publish failed after payment webhook'
+      );
     }
     return { ok: true, purchase: result.purchase, replayed: result.replayed };
   });
 
   app.post<{ Params: { slug: string } }>('/api/auctions/:slug/bids', async (request, reply) => {
-    const slug = request.params.slug;
     const parsed = placeBidSchema.safeParse(request.body);
     if (!parsed.success) {
-      recordBidOutcome({ auctionSlug: slug, outcome: 'invalid_body' });
+      recordBidOutcome({ auctionSlug: request.params.slug, outcome: 'invalid_body' });
       return reply.code(400).send({
         error: 'Invalid bid',
         details: parsed.error.flatten(),
@@ -599,18 +644,12 @@ export function buildApp(options: BuildAppOptions = {}) {
          FROM auctions
          WHERE slug = $1
          FOR UPDATE`,
-        [slug]
+        [request.params.slug]
       );
       const auction = locked.rows[0];
       if (!auction) {
         await client.query('ROLLBACK');
-        recordBidOutcome({
-          auctionSlug: slug,
-          bidderId,
-          amountCents,
-          actorRole: 'bidder',
-          outcome: 'not_found',
-        });
+        recordBidOutcome({ auctionSlug: request.params.slug, bidderId, outcome: 'not_found' });
         return reply.code(404).send({ error: 'Auction not found' });
       }
 
@@ -623,11 +662,10 @@ export function buildApp(options: BuildAppOptions = {}) {
       ) {
         await client.query('ROLLBACK');
         recordBidOutcome({
-          auctionSlug: slug,
+          auctionSlug: request.params.slug,
           auctionId: auction.id,
           bidderId,
           amountCents,
-          actorRole: 'bidder',
           outcome: 'ended',
         });
         return reply.code(400).send({ error: 'This auction has ended' });
@@ -636,7 +674,7 @@ export function buildApp(options: BuildAppOptions = {}) {
       if (auction.seller_id === bidderId) {
         await client.query('ROLLBACK');
         recordBidOutcome({
-          auctionSlug: slug,
+          auctionSlug: request.params.slug,
           auctionId: auction.id,
           bidderId,
           amountCents,
@@ -653,11 +691,10 @@ export function buildApp(options: BuildAppOptions = {}) {
       if (!bidder.rows[0]) {
         await client.query('ROLLBACK');
         recordBidOutcome({
-          auctionSlug: slug,
+          auctionSlug: request.params.slug,
           auctionId: auction.id,
           bidderId,
           amountCents,
-          actorRole: 'bidder',
           outcome: 'bidder_not_found',
         });
         return reply.code(400).send({ error: 'Bidder not found' });
@@ -666,17 +703,17 @@ export function buildApp(options: BuildAppOptions = {}) {
       const minimumBidCents = auction.current_amount_cents + MIN_INCREMENT_CENTS;
       if (amountCents < minimumBidCents) {
         await client.query('ROLLBACK');
-        const latest = await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id]);
-        const row = latest.rows[0];
-        const bids = row ? await loadBids(pool, row.id) : [];
         recordBidOutcome({
-          auctionSlug: slug,
+          auctionSlug: request.params.slug,
           auctionId: auction.id,
           bidderId,
           amountCents,
           actorRole: 'bidder',
           outcome: 'stale_bid',
         });
+        const latest = await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id]);
+        const row = latest.rows[0];
+        const bids = row ? await loadBids(pool, row.id) : [];
         return reply.code(400).send({
           error: `Bid must be at least $1.00 above the current amount (minimum ${minimumBidCents} cents)`,
           minimumBidCents,
@@ -686,53 +723,58 @@ export function buildApp(options: BuildAppOptions = {}) {
       }
 
       const bidId = randomUUID();
-      await client.query(
-        `INSERT INTO bids (id, auction_id, bidder_id, amount_cents, created_at)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [bidId, auction.id, bidderId, amountCents, acceptedAt.toISOString()]
+      await withBidAcceptSpan(
+        {
+          auctionSlug: request.params.slug,
+          auctionId: auction.id,
+          bidderId,
+          amountCents,
+          bidId,
+        },
+        async () => {
+          await client.query(
+            `INSERT INTO bids (id, auction_id, bidder_id, amount_cents, created_at, trace_context)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              bidId,
+              auction.id,
+              bidderId,
+              amountCents,
+              acceptedAt.toISOString(),
+              currentTraceparent(),
+            ]
+          );
+          await client.query(
+            `UPDATE auctions
+             SET current_amount_cents = $1,
+                 bid_count = bid_count + 1,
+                 leading_bidder_id = $2
+             WHERE id = $3`,
+            [amountCents, bidderId, auction.id]
+          );
+          await client.query('COMMIT');
+        }
       );
-      await client.query(
-        `UPDATE auctions
-         SET current_amount_cents = $1,
-             bid_count = bid_count + 1,
-             leading_bidder_id = $2
-         WHERE id = $3`,
-        [amountCents, bidderId, auction.id]
-      );
-
-      await client.query('COMMIT');
 
       // Fan-out only after commit; failure must not undo the accepted bid.
       try {
-        await publishAuctionChanged(slug);
+        await publishAuctionChanged(request.params.slug);
       } catch (error) {
-        request.log.error({ err: error, slug }, 'auction-changed publish failed');
+        request.log.error({ err: error, slug: request.params.slug }, 'auction-changed publish failed');
       }
 
       const updated = await pool.query<AuctionRow>(`${auctionSelect} WHERE a.id = $1`, [auction.id]);
       const row = updated.rows[0];
       if (!row) {
         recordBidOutcome({
-          auctionSlug: slug,
+          auctionSlug: request.params.slug,
           auctionId: auction.id,
-          bidderId,
-          amountCents,
           bidId,
-          actorRole: 'bidder',
           outcome: 'reload_failed',
         });
         return reply.code(500).send({ error: 'Bid saved but auction could not be reloaded' });
       }
       const bids = await loadBids(pool, row.id);
-      recordBidOutcome({
-        auctionSlug: slug,
-        auctionId: auction.id,
-        bidderId,
-        amountCents,
-        bidId,
-        actorRole: 'bidder',
-        outcome: 'accepted',
-      });
       return reply.code(201).send({ auction: serializeAuction(row, acceptedAt), bids });
     } catch (error) {
       await client.query('ROLLBACK');

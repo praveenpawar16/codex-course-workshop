@@ -1,3 +1,5 @@
+import './otel.js';
+
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 
@@ -8,6 +10,7 @@ import {
   type CloseClock,
 } from './closeAuction.js';
 import { connectRabbitPublisher, type RabbitPublisher } from './rabbitmq.js';
+import { currentTraceparent, withContinuedTrace } from './traceContext.js';
 
 const connectionString =
   process.env.DATABASE_URL ?? 'postgres://auction:auction@localhost:55432/auction_part_8';
@@ -33,7 +36,23 @@ export async function publishUnpublishedOutbox(
   const rows = await listUnpublishedCloseOutbox(pool, limit);
   let published = 0;
   for (const row of rows) {
-    await publisher.publishAuctionClosed(row.payload);
+    await withContinuedTrace(
+      row.payload.traceparent,
+      'auction.close.publish',
+      {
+        'auction.slug': row.payload.auctionSlug,
+        'auction.id': row.payload.auctionId,
+        'outbox.id': row.id,
+      },
+      async () => {
+        // Re-read inside the span so AMQP headers carry the publish span, not just the close span.
+        const traceparent = currentTraceparent() ?? row.payload.traceparent ?? undefined;
+        await publisher.publishAuctionClosed(
+          row.payload,
+          traceparent ? { traceparent } : undefined
+        );
+      }
+    );
     const marked = await markCloseOutboxPublished(pool, row.id);
     if (marked) published += 1;
   }

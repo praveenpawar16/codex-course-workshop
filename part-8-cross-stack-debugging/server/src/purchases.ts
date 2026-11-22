@@ -4,6 +4,13 @@ import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 import { z } from 'zod';
 
+import {
+  currentTraceparent,
+  isTraceparent,
+  recordBusinessOutcome,
+  withContinuedTrace,
+} from './traceContext.js';
+
 export type PurchaseRow = {
   id: string;
   auction_id: string;
@@ -13,6 +20,7 @@ export type PurchaseRow = {
   stripe_checkout_session_id: string | null;
   paid_at: Date | null;
   created_at: Date;
+  trace_context: string | null;
 };
 
 export type PurchaseView = {
@@ -132,6 +140,7 @@ export async function resolveCheckoutSession(input: {
     title: input.title,
     amountCents: input.purchase.amount_cents,
     slug: input.slug,
+    traceparent: input.purchase.trace_context,
   });
   const recovered = Boolean(input.purchase.stripe_checkout_session_id);
   return { ...created, recovered };
@@ -142,7 +151,7 @@ export async function loadPurchaseForAuction(
   auctionId: string
 ): Promise<PurchaseRow | null> {
   const result = await pool.query<PurchaseRow>(
-    `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at
+    `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at, trace_context
      FROM purchases WHERE auction_id = $1`,
     [auctionId]
   );
@@ -151,10 +160,15 @@ export async function loadPurchaseForAuction(
 
 export async function getOrCreatePurchase(
   client: pg.PoolClient,
-  input: { auctionId: string; winnerId: string; amountCents: number }
+  input: {
+    auctionId: string;
+    winnerId: string;
+    amountCents: number;
+    traceContext?: string | null;
+  }
 ): Promise<PurchaseRow> {
   const existing = await client.query<PurchaseRow>(
-    `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at
+    `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at, trace_context
      FROM purchases WHERE auction_id = $1 FOR UPDATE`,
     [input.auctionId]
   );
@@ -165,15 +179,24 @@ export async function getOrCreatePurchase(
         statusCode: 409,
       });
     }
+    // Keep an existing trace anchor; backfill only when the Purchase predates trace capture.
+    if (!row.trace_context && input.traceContext) {
+      const filled = await client.query<{ trace_context: string | null }>(
+        `UPDATE purchases SET trace_context = $2 WHERE id = $1 AND trace_context IS NULL
+         RETURNING trace_context`,
+        [row.id, input.traceContext]
+      );
+      return { ...row, trace_context: filled.rows[0]?.trace_context ?? row.trace_context };
+    }
     return row;
   }
 
   const id = randomUUID();
   const inserted = await client.query<PurchaseRow>(
-    `INSERT INTO purchases (id, auction_id, winner_id, amount_cents, status)
-     VALUES ($1, $2, $3, $4, 'unpaid')
-     RETURNING id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at`,
-    [id, input.auctionId, input.winnerId, input.amountCents]
+    `INSERT INTO purchases (id, auction_id, winner_id, amount_cents, status, trace_context)
+     VALUES ($1, $2, $3, $4, 'unpaid', $5)
+     RETURNING id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at, trace_context`,
+    [id, input.auctionId, input.winnerId, input.amountCents, input.traceContext ?? null]
   );
   return inserted.rows[0]!;
 }
@@ -183,15 +206,23 @@ export async function createCheckoutSession(input: {
   title: string;
   amountCents: number;
   slug: string;
+  traceparent?: string | null;
 }): Promise<{ id: string; url: string }> {
+  const traceparent = isTraceparent(input.traceparent)
+    ? input.traceparent.trim()
+    : (currentTraceparent() ?? undefined);
   const successUrl = `${webPublicUrl}/auctions/${encodeURIComponent(input.slug)}?checkout=success&session_id={CHECKOUT_SESSION_ID}`;
   const cancelUrl = `${webPublicUrl}/auctions/${encodeURIComponent(input.slug)}?checkout=canceled`;
   const response = await fetch(`${stripeBaseUrl}/v1/checkout/sessions`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(traceparent ? { traceparent } : {}),
+    },
     body: JSON.stringify({
       mode: 'payment',
       client_reference_id: input.purchaseId,
+      ...(traceparent ? { metadata: { traceparent } } : {}),
       line_items: [
         {
           price_data: {
@@ -239,13 +270,14 @@ function signaturesMatch(expected: string, provided: string): boolean {
 }
 
 export type WebhookResult =
-  | { ok: true; purchase: PurchaseView; replayed: boolean }
+  | { ok: true; purchase: PurchaseView; replayed: boolean; auctionSlug: string }
   | { ok: false; statusCode: number; error: string };
 
 export async function applyStripeWebhook(
   pool: pg.Pool,
   rawBody: string,
-  signatureHeader: string | undefined
+  signatureHeader: string | undefined,
+  options: { traceparent?: string } = {}
 ): Promise<WebhookResult> {
   if (!signatureHeader) {
     return { ok: false, statusCode: 400, error: 'Missing Stripe signature' };
@@ -267,6 +299,7 @@ export async function applyStripeWebhook(
   }
 
   const event = parsed.data;
+  const webhookTraceparent = isTraceparent(options.traceparent) ? options.traceparent : null;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -276,9 +309,12 @@ export async function applyStripeWebhook(
       [event.eventId]
     );
     if (already.rows[0]) {
-      const purchase = await client.query<PurchaseRow>(
-        `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at
-         FROM purchases WHERE id = $1`,
+      const purchase = await client.query<PurchaseRow & { auction_slug: string }>(
+        `SELECT p.id, p.auction_id, p.winner_id, p.amount_cents, p.status, p.stripe_checkout_session_id,
+                p.paid_at, p.created_at, p.trace_context, a.slug AS auction_slug
+         FROM purchases p
+         JOIN auctions a ON a.id = p.auction_id
+         WHERE p.id = $1`,
         [already.rows[0].purchase_id]
       );
       await client.query('COMMIT');
@@ -286,11 +322,24 @@ export async function applyStripeWebhook(
       if (!row) {
         return { ok: false, statusCode: 500, error: 'Webhook event missing purchase' };
       }
-      return { ok: true, purchase: serializePurchase(row), replayed: true };
+      await withContinuedTrace(
+        webhookTraceparent ?? row.trace_context,
+        'purchase.mark_paid',
+        { 'purchase.id': row.id, 'auction.id': row.auction_id },
+        async (span) => {
+          recordBusinessOutcome(span, 'replayed', { 'payment.outcome': 'replayed' });
+        }
+      );
+      return {
+        ok: true,
+        purchase: serializePurchase(row),
+        replayed: true,
+        auctionSlug: row.auction_slug,
+      };
     }
 
     const locked = await client.query<PurchaseRow>(
-      `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at
+      `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at, trace_context
        FROM purchases WHERE id = $1 FOR UPDATE`,
       [event.data.object.client_reference_id]
     );
@@ -304,29 +353,52 @@ export async function applyStripeWebhook(
       return { ok: false, statusCode: 409, error: 'Webhook amount does not match Purchase' };
     }
 
-    if (purchase.status === 'unpaid') {
-      await client.query(
-        `UPDATE purchases
-         SET status = 'paid',
-             paid_at = now(),
-             stripe_checkout_session_id = COALESCE(stripe_checkout_session_id, $2)
-         WHERE id = $1`,
-        [purchase.id, event.data.object.id]
-      );
-    }
+    await withContinuedTrace(
+      webhookTraceparent ?? purchase.trace_context,
+      'purchase.mark_paid',
+      {
+        'purchase.id': purchase.id,
+        'auction.id': purchase.auction_id,
+        'purchase.amount_cents': purchase.amount_cents,
+      },
+      async (span) => {
+        if (purchase.status === 'unpaid') {
+          await client.query(
+            `UPDATE purchases
+             SET status = 'paid',
+                 paid_at = now(),
+                 stripe_checkout_session_id = COALESCE(stripe_checkout_session_id, $2)
+             WHERE id = $1`,
+            [purchase.id, event.data.object.id]
+          );
+        }
 
-    await client.query(
-      `INSERT INTO stripe_webhook_events (event_id, purchase_id) VALUES ($1, $2)`,
-      [event.eventId, purchase.id]
+        await client.query(
+          `INSERT INTO stripe_webhook_events (event_id, purchase_id) VALUES ($1, $2)`,
+          [event.eventId, purchase.id]
+        );
+        recordBusinessOutcome(span, purchase.status === 'unpaid' ? 'paid' : 'replayed', {
+          'payment.outcome': purchase.status === 'unpaid' ? 'paid' : 'replayed',
+        });
+      }
     );
 
-    const updated = await client.query<PurchaseRow>(
-      `SELECT id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id, paid_at, created_at
-       FROM purchases WHERE id = $1`,
+    const updated = await client.query<PurchaseRow & { auction_slug: string }>(
+      `SELECT p.id, p.auction_id, p.winner_id, p.amount_cents, p.status, p.stripe_checkout_session_id,
+              p.paid_at, p.created_at, p.trace_context, a.slug AS auction_slug
+       FROM purchases p
+       JOIN auctions a ON a.id = p.auction_id
+       WHERE p.id = $1`,
       [purchase.id]
     );
     await client.query('COMMIT');
-    return { ok: true, purchase: serializePurchase(updated.rows[0]!), replayed: purchase.status === 'paid' };
+    const row = updated.rows[0]!;
+    return {
+      ok: true,
+      purchase: serializePurchase(row),
+      replayed: purchase.status === 'paid',
+      auctionSlug: row.auction_slug,
+    };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

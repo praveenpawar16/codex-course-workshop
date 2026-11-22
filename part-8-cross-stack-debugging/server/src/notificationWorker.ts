@@ -1,3 +1,5 @@
+import './otel.js';
+
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { createClient, type RedisClientType } from 'redis';
@@ -6,6 +8,7 @@ import { AUCTION_CLOSED_EVENT, type AuctionClosedPayload } from './closeAuction.
 import { CLOSE_NOTIFICATION_CHANNEL } from './closeNotificationBus.js';
 import { deliverCloseNotifications } from './notifyClose.js';
 import { connectAuctionCloseConsumer } from './rabbitmqConsumer.js';
+import { isTraceparent, withContinuedTrace } from './traceContext.js';
 
 const connectionString =
   process.env.DATABASE_URL ?? 'postgres://auction:auction@localhost:55432/auction_part_8';
@@ -72,13 +75,26 @@ export async function startNotificationWorker(options: NotificationWorkerOptions
 
   const consumer = await connectAuctionCloseConsumer(
     options.rabbitUrl ?? rabbitUrl,
-    async (raw) => {
-      if (!isAuctionClosedPayload(raw)) {
+    async (body, raw) => {
+      if (!isAuctionClosedPayload(body)) {
         throw new Error('Invalid auction.closed payload');
       }
-      const result = await processMessage(raw);
-      logger.info(
-        `notification-worker auction=${raw.auctionSlug} emitted=${result.emitted.length} recipients=${result.recipients.length}`
+      const headerValue = raw.properties.headers?.traceparent as unknown;
+      const traceparent = isTraceparent(headerValue) ? headerValue : body.traceparent;
+      await withContinuedTrace(
+        traceparent,
+        'auction.close.notify',
+        {
+          'auction.slug': body.auctionSlug,
+          'auction.id': body.auctionId,
+          'auction.outcome': body.outcome,
+        },
+        async () => {
+          const result = await processMessage(body);
+          logger.info(
+            `notification-worker auction=${body.auctionSlug} emitted=${result.emitted.length} recipients=${result.recipients.length}`
+          );
+        }
       );
     },
     { logger }

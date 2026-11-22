@@ -3,6 +3,8 @@ import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 import Fastify from 'fastify';
 import { z } from 'zod';
 
+import { pickTraceparent, recordPaymentOutcome, withContinuedTrace } from './tracing.js';
+
 const createSessionSchema = z.object({
   mode: z.literal('payment'),
   client_reference_id: z.string().uuid(),
@@ -16,6 +18,7 @@ const createSessionSchema = z.object({
   })).length(1),
   success_url: z.string().url(),
   cancel_url: z.string().url(),
+  metadata: z.object({ traceparent: z.string().optional() }).optional(),
 });
 const attemptSchema = z.object({
   cardNumber: z.string().transform((value) => value.replace(/\s/g, '')).pipe(z.string().regex(/^\d{16}$/)),
@@ -34,6 +37,7 @@ type CheckoutSession = {
   cancel_url: string;
   title: string;
   amount_cents: number;
+  traceparent: string | null;
   completion: null | {
     body: string;
     signature: string;
@@ -70,13 +74,21 @@ export function buildStripeApp(options: {
   logger?: boolean;
   webhookUrl?: string;
   webhookSecret?: string;
-  deliverWebhook?: (body: string, signature: string) => Promise<boolean>;
+  deliverWebhook?: (body: string, signature: string, traceparent?: string | null) => Promise<boolean>;
 } = {}) {
   const baseUrl = options.baseUrl ?? 'http://127.0.0.1:7107';
   const webhookUrl = options.webhookUrl ?? 'http://127.0.0.1:3107/api/webhooks/stripe';
   const webhookSecret = options.webhookSecret ?? 'whsec_local_part_7';
-  const deliverWebhook = options.deliverWebhook ?? (async (body: string, signature: string) => {
-    const response = await fetch(webhookUrl, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stripe-signature': signature }, body });
+  const deliverWebhook = options.deliverWebhook ?? (async (body: string, signature: string, traceparent?: string | null) => {
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-stripe-signature': signature,
+        ...(traceparent ? { traceparent } : {}),
+      },
+      body,
+    });
     return response.ok;
   });
   const sessions = new Map<string, CheckoutSession>();
@@ -86,9 +98,12 @@ export function buildStripeApp(options: {
     if (!session.completion) throw new Error('Completed Session is missing its event');
     if (session.completion.delivered) return true;
     try {
-      session.completion.delivered = await deliverWebhook(
-        session.completion.body,
-        session.completion.signature,
+      const completion = session.completion;
+      completion.delivered = await withContinuedTrace(
+        session.traceparent,
+        'stripe.webhook.deliver',
+        { 'stripe.session_id': session.id },
+        () => deliverWebhook(completion.body, completion.signature, session.traceparent),
       );
     } catch {
       session.completion.delivered = false;
@@ -123,6 +138,7 @@ export function buildStripeApp(options: {
       cancel_url: parsed.data.cancel_url,
       title: lineItem.price_data.product_data.name,
       amount_cents: lineItem.price_data.unit_amount,
+      traceparent: pickTraceparent(parsed.data.metadata?.traceparent) ?? pickTraceparent(request.headers.traceparent),
       completion: null,
     };
     sessions.set(id, session);
@@ -149,31 +165,35 @@ export function buildStripeApp(options: {
     const session = id.success ? sessions.get(id.data.id) : undefined;
     if (!session) return reply.code(404).send({ error: 'Checkout Session not found.' });
     if (!parsed.success) return reply.code(400).send({ error: 'Enter valid test card details.' });
-    if (session.status === 'complete') {
-      const delivered = await deliverCompletion(session);
-      if (!delivered) return reply.code(502).send({ error: 'Payment was received, but confirmation is still pending. Try again.' });
-      return { redirect_url: session.success_url.replace('{CHECKOUT_SESSION_ID}', session.id) };
-    }
-    if (parsed.data.cardNumber === '4000000000000002') {
-      return reply.code(402).send({ error: 'Your card was declined. Use a different card and try again.' });
-    }
-    if (parsed.data.cardNumber === '4242424242424242') {
-      const event = {
-        eventId: randomUUID(),
-        eventType: 'checkout.session.completed',
-        occurredAt: new Date().toISOString(),
-        data: { object: { id: session.id, object: session.object, status: 'complete', payment_status: 'paid', client_reference_id: session.client_reference_id, amount_total: session.amount_cents, currency: 'usd' } },
-      };
-      const body = JSON.stringify(event);
-      const signature = createHmac('sha256', webhookSecret).update(body).digest('hex');
-      session.status = 'complete';
-      session.payment_status = 'paid';
-      session.completion = { body, signature, delivered: false };
-      const delivered = await deliverCompletion(session);
-      if (!delivered) return reply.code(502).send({ error: 'Payment was received, but confirmation is still pending. Try again.' });
-      return { redirect_url: session.success_url.replace('{CHECKOUT_SESSION_ID}', session.id) };
-    }
-    return reply.code(409).send({ error: 'This payment method is not available.' });
+    return withContinuedTrace(session.traceparent, 'stripe.checkout.attempt', { 'stripe.session_id': session.id }, async () => {
+      if (session.status === 'complete') {
+        const delivered = await deliverCompletion(session);
+        if (!delivered) return reply.code(502).send({ error: 'Payment was received, but confirmation is still pending. Try again.' });
+        return { redirect_url: session.success_url.replace('{CHECKOUT_SESSION_ID}', session.id) };
+      }
+      if (parsed.data.cardNumber === '4000000000000002') {
+        recordPaymentOutcome('declined');
+        return reply.code(402).send({ error: 'Your card was declined. Use a different card and try again.' });
+      }
+      if (parsed.data.cardNumber === '4242424242424242') {
+        const event = {
+          eventId: randomUUID(),
+          eventType: 'checkout.session.completed',
+          occurredAt: new Date().toISOString(),
+          data: { object: { id: session.id, object: session.object, status: 'complete', payment_status: 'paid', client_reference_id: session.client_reference_id, amount_total: session.amount_cents, currency: 'usd' } },
+        };
+        const body = JSON.stringify(event);
+        const signature = createHmac('sha256', webhookSecret).update(body).digest('hex');
+        session.status = 'complete';
+        session.payment_status = 'paid';
+        session.completion = { body, signature, delivered: false };
+        recordPaymentOutcome('paid');
+        const delivered = await deliverCompletion(session);
+        if (!delivered) return reply.code(502).send({ error: 'Payment was received, but confirmation is still pending. Try again.' });
+        return { redirect_url: session.success_url.replace('{CHECKOUT_SESSION_ID}', session.id) };
+      }
+      return reply.code(409).send({ error: 'This payment method is not available.' });
+    });
   });
 
   return app;

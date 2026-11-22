@@ -5,6 +5,7 @@ import {
   scrubSpanAttributes,
   shouldDropSpanName,
   shouldIgnoreIncomingRequest,
+  shouldIgnoreStripeIncomingRequest,
 } from './otelFilters.js';
 
 function req(method: string, url: string): IncomingMessage {
@@ -30,6 +31,15 @@ describe('otelFilters', () => {
     );
     expect(shouldIgnoreIncomingRequest(req('POST', '/api/webhooks/stripe'))).toBe(false);
     expect(shouldIgnoreIncomingRequest(req('POST', '/api/auctions'))).toBe(false);
+  });
+
+  it('ignores mock Stripe health and hosted checkout HTML but keeps the workflow calls', () => {
+    expect(shouldIgnoreStripeIncomingRequest(req('GET', '/health'))).toBe(true);
+    expect(shouldIgnoreStripeIncomingRequest(req('GET', '/checkout/cs_test_1'))).toBe(true);
+    expect(shouldIgnoreStripeIncomingRequest(req('POST', '/v1/checkout/sessions'))).toBe(false);
+    expect(
+      shouldIgnoreStripeIncomingRequest(req('POST', '/v1/checkout/sessions/cs_test_1/attempt'))
+    ).toBe(false);
   });
 
   it('scrubs SQL text and card-ish attributes', () => {

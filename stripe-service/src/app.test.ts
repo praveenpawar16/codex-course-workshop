@@ -113,4 +113,43 @@ describe('mock Stripe Checkout', () => {
     expect(samePurchase.json().id).toBe(session.id);
     await successApp.close();
   });
-});
+
+  it('carries traceparent from session metadata or header into the webhook delivery', async () => {
+    const traceparent = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+    const headerTrace = '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01';
+    const traces: Array<string | null | undefined> = [];
+    const traceApp = buildStripeApp({
+      baseUrl: 'http://stripe.test',
+      logger: false,
+      deliverWebhook: async (_body, _signature, delivered) => {
+        traces.push(delivered);
+        return true;
+      },
+    });
+    const create = (traceOptions: { metadata?: { traceparent: string }; headers?: Record<string, string> }) =>
+      traceApp.inject({
+        method: 'POST',
+        url: '/v1/checkout/sessions',
+        headers: traceOptions.headers,
+        payload: {
+          mode: 'payment',
+          client_reference_id: crypto.randomUUID(),
+          line_items: [{ price_data: { currency: 'usd', product_data: { name: 'Traced server' }, unit_amount: 5_000 }, quantity: 1 }],
+          success_url: 'http://marketplace.test/items/server?checkout=success&session_id={CHECKOUT_SESSION_ID}',
+          cancel_url: 'http://marketplace.test/items/server?checkout=canceled',
+          ...(traceOptions.metadata ? { metadata: traceOptions.metadata } : {}),
+        },
+      });
+    const pay = (id: string) =>
+      traceApp.inject({ method: 'POST', url: `/v1/checkout/sessions/${id}/attempt`, payload: { cardNumber: '4242 4242 4242 4242', expiry: '12 / 30', cvc: '123' } });
+
+    const fromMetadata = await create({ metadata: { traceparent }, headers: { traceparent: headerTrace } });
+    const fromHeader = await create({ headers: { traceparent: headerTrace } });
+    const untraced = await create({});
+    for (const created of [fromMetadata, fromHeader, untraced]) {
+      expect(created.statusCode).toBe(201);
+      expect((await pay(created.json().id)).statusCode).toBe(200);
+    }
+    expect(traces).toEqual([traceparent, headerTrace, null]);
+    await traceApp.close();
+  });});

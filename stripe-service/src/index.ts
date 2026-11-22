@@ -1,3 +1,5 @@
+import './otel.js';
+
 import { buildStripeApp } from './app.js';
 
 const port = Number(process.env.STRIPE_PORT ?? 7107);

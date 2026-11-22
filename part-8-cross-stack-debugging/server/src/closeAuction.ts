@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import type pg from 'pg';
 
+import { currentTraceparent, withContinuedTrace } from './traceContext.js';
+
 export const AUCTION_CLOSED_EVENT = 'auction.closed';
 
 export type CloseClock = () => Date;
@@ -26,7 +28,27 @@ export type AuctionClosedPayload = {
   outcome: 'sold' | 'unsold';
   winnerId: string | null;
   winningAmountCents: number | null;
+  /** W3C traceparent of the `auction.close.record` span, carried through outbox → AMQP. */
+  traceparent?: string | null;
 };
+
+/** Latest bid matching the recorded winner and amount; its trace anchors Close → Checkout. */
+export async function loadWinningBidTraceContext(
+  client: pg.Pool | pg.PoolClient,
+  auctionId: string,
+  winnerId: string,
+  amountCents: number
+): Promise<string | null> {
+  const result = await client.query<{ trace_context: string | null }>(
+    `SELECT trace_context
+     FROM bids
+     WHERE auction_id = $1 AND bidder_id = $2 AND amount_cents = $3
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [auctionId, winnerId, amountCents]
+  );
+  return result.rows[0]?.trace_context ?? null;
+}
 
 type ClaimedAuctionRow = {
   id: string;
@@ -80,50 +102,72 @@ export async function closeDueAuctions(
       const closedAt = at.toISOString();
       const outboxId = randomUUID();
 
-      const updated = await client.query(
-        `UPDATE auctions
-         SET closed_at = $1,
-             winner_id = $2,
-             winning_amount_cents = $3
-         WHERE id = $4
-           AND closed_at IS NULL`,
-        [closedAt, winnerId, winningAmountCents, row.id]
+      // Sold closes continue the Winning Bid's trace; unsold closes start a short fresh trace.
+      const winningTraceContext = sold
+        ? await loadWinningBidTraceContext(client, row.id, winnerId!, winningAmountCents!)
+        : null;
+
+      const recorded = await withContinuedTrace(
+        winningTraceContext,
+        'auction.close.record',
+        {
+          'auction.id': row.id,
+          'auction.slug': row.slug,
+          'auction.outcome': outcome,
+          'outbox.id': outboxId,
+        },
+        async (): Promise<ClosedAuctionResult | null> => {
+          const updated = await client.query(
+            `UPDATE auctions
+             SET closed_at = $1,
+                 winner_id = $2,
+                 winning_amount_cents = $3
+             WHERE id = $4
+               AND closed_at IS NULL`,
+            [closedAt, winnerId, winningAmountCents, row.id]
+          );
+
+          if (updated.rowCount !== 1) {
+            return null;
+          }
+
+          const payload: AuctionClosedPayload = {
+            eventType: AUCTION_CLOSED_EVENT,
+            auctionId: row.id,
+            auctionSlug: row.slug,
+            sellerId: row.seller_id,
+            closedAt,
+            outcome,
+            winnerId,
+            winningAmountCents,
+            // Captured after the record span starts so the outbox carries the close span.
+            traceparent: currentTraceparent(),
+          };
+
+          await client.query(
+            `INSERT INTO auction_close_outbox (id, auction_id, event_type, payload)
+             VALUES ($1, $2, $3, $4::jsonb)`,
+            [outboxId, row.id, AUCTION_CLOSED_EVENT, JSON.stringify(payload)]
+          );
+
+          return {
+            auctionId: row.id,
+            slug: row.slug,
+            sellerId: row.seller_id,
+            closedAt,
+            outcome,
+            winnerId,
+            winningAmountCents,
+            outboxId,
+            payload,
+          };
+        }
       );
 
-      if (updated.rowCount !== 1) {
-        continue;
+      if (recorded) {
+        results.push(recorded);
       }
-
-      const payload: AuctionClosedPayload = {
-        eventType: AUCTION_CLOSED_EVENT,
-        auctionId: row.id,
-        auctionSlug: row.slug,
-        sellerId: row.seller_id,
-        closedAt,
-        outcome,
-        winnerId,
-        winningAmountCents,
-      };
-
-      await client.query(
-        `INSERT INTO auction_close_outbox (id, auction_id, event_type, payload)
-         VALUES ($1, $2, $3, $4::jsonb)`,
-        [outboxId, row.id, AUCTION_CLOSED_EVENT, JSON.stringify(payload)]
-      );
-
-      results.push({
-        auctionId: row.id,
-        slug: row.slug,
-        sellerId: row.seller_id,
-        closedAt,
-        outcome,
-        winnerId,
-        winningAmountCents,
-        outboxId,
-        payload,
-      });
     }
-
     await client.query('COMMIT');
     return results;
   } catch (error) {

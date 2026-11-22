@@ -1,4 +1,6 @@
+import { propagation } from '@opentelemetry/api';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { W3CTraceContextPropagator, type ExportResult } from '@opentelemetry/core';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { NodeSDK } from '@opentelemetry/sdk-node';
 import {
@@ -6,13 +8,18 @@ import {
   type ReadableSpan,
   type SpanExporter,
 } from '@opentelemetry/sdk-trace-base';
-import type { ExportResult } from '@opentelemetry/core';
 
 import {
   scrubSpanAttributes,
   shouldDropSpanName,
   shouldIgnoreIncomingRequest,
 } from './otelFilters.js';
+
+propagation.setGlobalPropagator(new W3CTraceContextPropagator());
+
+/** Unit tests import workers without a collector; keep SDK startup out of them. */
+const otelDisabled =
+  process.env.OTEL_SDK_DISABLED === 'true' || Boolean(process.env.VITEST);
 
 const serviceName = process.env.OTEL_SERVICE_NAME ?? 'auction-api';
 const otlpEndpoint =
@@ -51,31 +58,37 @@ class FilteringSpanExporter implements SpanExporter {
   }
 }
 
-const exporter = new FilteringSpanExporter(
-  new OTLPTraceExporter({
-    url: `${otlpEndpoint.replace(/\/$/, '')}/v1/traces`,
-  })
-);
+function startSdk(): void {
+  const exporter = new FilteringSpanExporter(
+    new OTLPTraceExporter({
+      url: `${otlpEndpoint.replace(/\/$/, '')}/v1/traces`,
+    })
+  );
 
-const sdk = new NodeSDK({
-  serviceName,
-  spanProcessors: [new BatchSpanProcessor(exporter)],
-  instrumentations: [
-    getNodeAutoInstrumentations({
-      '@opentelemetry/instrumentation-fs': { enabled: false },
-      '@opentelemetry/instrumentation-dns': { enabled: false },
-      '@opentelemetry/instrumentation-net': { enabled: false },
-      '@opentelemetry/instrumentation-redis': { enabled: false },
-      '@opentelemetry/instrumentation-ioredis': { enabled: false },
-      '@opentelemetry/instrumentation-http': {
-        ignoreIncomingRequestHook: shouldIgnoreIncomingRequest,
-      },
-      '@opentelemetry/instrumentation-pg': {
-        enhancedDatabaseReporting: false,
-        requireParentSpan: true,
-      },
-    } as Parameters<typeof getNodeAutoInstrumentations>[0]),
-  ],
-});
+  const sdk = new NodeSDK({
+    serviceName,
+    spanProcessors: [new BatchSpanProcessor(exporter)],
+    instrumentations: [
+      getNodeAutoInstrumentations({
+        '@opentelemetry/instrumentation-fs': { enabled: false },
+        '@opentelemetry/instrumentation-dns': { enabled: false },
+        '@opentelemetry/instrumentation-net': { enabled: false },
+        '@opentelemetry/instrumentation-redis': { enabled: false },
+        '@opentelemetry/instrumentation-ioredis': { enabled: false },
+        '@opentelemetry/instrumentation-http': {
+          ignoreIncomingRequestHook: shouldIgnoreIncomingRequest,
+        },
+        '@opentelemetry/instrumentation-pg': {
+          enhancedDatabaseReporting: false,
+          requireParentSpan: true,
+        },
+      } as Parameters<typeof getNodeAutoInstrumentations>[0]),
+    ],
+  });
 
-sdk.start();
+  sdk.start();
+}
+
+if (!otelDisabled) {
+  startSdk();
+}

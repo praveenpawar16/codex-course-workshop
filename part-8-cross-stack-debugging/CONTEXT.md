@@ -1,6 +1,6 @@
-# Auction House (cross-stack observability)
+# Auction House (winner checkout)
 
-Domain language for posting auctions, placing bids, live detail updates, recording the close outcome, collecting payment from the Winner after Close, and following that workflow in traces. Implementation details live elsewhere.
+Domain language for posting auctions, placing bids, live detail updates, recording the close outcome, and collecting payment from the Winner after Close. Implementation details live elsewhere.
 
 ## Language
 
@@ -109,9 +109,5 @@ The Winner-started flow that opens a payment session against the local Stripe-sh
 _Avoid_: Real Stripe account setup, API-key configuration, Buyer (use Winner)
 
 **Payment visibility**:
-Whether a Purchase is Unpaid or Paid, shown only to the Seller and the Winner of that Auction.
+Whether a Purchase is awaiting payment or Paid, shown only to the Seller and the Winner of that Auction. The Seller’s detail view updates when payment lands without requiring a manual refresh.
 _Avoid_: Public payment status, bidder-wide ledger
-
-**Trace**:
-A linked set of spans for one auction workflow, viewed in Jaeger. High-signal Bid, Close, messaging, Checkout, and Paid work stays; routine polls and framework chatter do not.
-_Avoid_: In-app tracing screen, logging every GET, SQL text or card data on spans

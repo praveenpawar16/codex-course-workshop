@@ -1,11 +1,16 @@
 import amqp, { type ChannelModel, type ConfirmChannel } from 'amqplib';
 
+import { isTraceparent } from './traceContext.js';
+
 export const AUCTION_CLOSE_EXCHANGE = 'auction.close';
 export const AUCTION_CLOSE_ROUTING_KEY = 'auction.closed';
 export const AUCTION_CLOSE_QUEUE = 'auction.close';
 
 export type RabbitPublisher = {
-  publishAuctionClosed: (payload: unknown) => Promise<void>;
+  publishAuctionClosed: (
+    payload: unknown,
+    headers?: Record<string, string>
+  ) => Promise<void>;
   close: () => Promise<void>;
 };
 
@@ -25,11 +30,21 @@ export async function connectRabbitPublisher(
   });
 
   return {
-    async publishAuctionClosed(payload: unknown) {
+    async publishAuctionClosed(payload: unknown, headers?: Record<string, string>) {
       const body = Buffer.from(JSON.stringify(payload));
+      const messageHeaders: Record<string, string> = { ...headers };
+      const payloadTraceparent =
+        payload && typeof payload === 'object'
+          ? (payload as { traceparent?: unknown }).traceparent
+          : undefined;
+      // Explicit headers (e.g. the publish span) win; otherwise fall back to the outbox payload.
+      if (!messageHeaders.traceparent && isTraceparent(payloadTraceparent)) {
+        messageHeaders.traceparent = payloadTraceparent.trim();
+      }
       const wrote = channel.publish(AUCTION_CLOSE_EXCHANGE, AUCTION_CLOSE_ROUTING_KEY, body, {
         contentType: 'application/json',
         persistent: true,
+        headers: messageHeaders,
       });
       if (!wrote) {
         await new Promise<void>((resolve) => channel.once('drain', () => resolve()));

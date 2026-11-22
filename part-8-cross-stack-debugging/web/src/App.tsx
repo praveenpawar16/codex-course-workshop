@@ -488,7 +488,7 @@ function ItemPage({ slug }: { slug: string }) {
               <div className="purchase-panel" data-testid="purchase-panel">
                 <span>Purchase</span>
                 <strong data-testid="purchase-status">
-                  {auction.purchase.status === 'paid' ? 'Paid' : 'Unpaid'}
+                  {auction.purchase.status === 'paid' ? 'Paid' : 'Awaiting payment'}
                 </strong>
                 <small>
                   {formatCurrencyFromCents(auction.purchase.amountCents)}

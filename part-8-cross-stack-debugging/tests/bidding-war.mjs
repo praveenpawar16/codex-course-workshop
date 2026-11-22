@@ -556,7 +556,39 @@ async function main() {
     assert.equal(winnerPopup.title, 'You won this auction');
     console.log(`[bidding-war] winner modal (${winnerName}): "${winnerPopup.title}"`);
 
-    console.log(`[bidding-war] PASS — holding windows open for ${HOLD_MS}ms`);
+    for (const page of [seller.page, winnerWindow.page]) {
+      const dismiss = page.getByTestId('close-notification-dismiss');
+      if (await dismiss.count()) {
+        await dismiss.first().click({ timeout: 5_000 }).catch(() => undefined);
+      }
+    }
+
+    await seller.page.waitForSelector('[data-testid="purchase-panel"]', { timeout: 20_000 });
+    await winnerWindow.page.waitForSelector('[data-testid="purchase-panel"]', { timeout: 20_000 });
+    const awaiting = await seller.page.locator('[data-testid="purchase-status"]').textContent();
+    assert.match(awaiting ?? '', /Awaiting payment/i);
+    console.log('[bidding-war] seller shows Awaiting payment');
+
+    console.log('[bidding-war] winner starting checkout and paying…');
+    await winnerWindow.page.getByTestId('complete-purchase').click();
+    await winnerWindow.page.waitForURL(/127\.0\.0\.1:7108\/checkout\//, { timeout: 20_000 });
+    await winnerWindow.page.locator('#card').fill('4242 4242 4242 4242');
+    await winnerWindow.page.locator('#expiry').fill('12 / 30');
+    await winnerWindow.page.locator('#cvc').fill('123');
+    await winnerWindow.page.getByRole('button', { name: /^Pay / }).click();
+    await winnerWindow.page.waitForURL(new RegExp(`/auctions/${slug}`), { timeout: 30_000 });
+    await winnerWindow.page.waitForFunction(() => {
+      return document.querySelector('[data-testid="purchase-status"]')?.textContent?.includes('Paid');
+    });
+
+    console.log('[bidding-war] waiting for seller Paid without reload…');
+    await seller.page.waitForFunction(() => {
+      return document.querySelector('[data-testid="purchase-status"]')?.textContent?.includes('Paid');
+    }, null, { timeout: 20_000 });
+    assert.ok(await seller.page.locator('[data-testid="seller-paid-hint"]').count());
+    console.log('[bidding-war] PASS — seller flipped Awaiting payment → Paid live');
+
+    console.log(`[bidding-war] holding windows open for ${HOLD_MS}ms`);
     await sleep(HOLD_MS);
   } finally {
     for (const guard of guards) guard.dispose();
