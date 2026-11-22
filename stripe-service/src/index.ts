@@ -1,6 +1,4 @@
-import './otel.js';
-
-const { buildStripeApp } = await import('./app.js');
+import { buildStripeApp } from './app.js';
 
 const port = Number(process.env.STRIPE_PORT ?? 7107);
 const app = buildStripeApp({
@@ -10,7 +8,7 @@ const app = buildStripeApp({
 });
 
 try {
-  await app.listen({ port, host: '127.0.0.1' });
+  await app.listen({ port, host: '0.0.0.0' });
 } catch (error) {
   app.log.error(error);
   process.exit(1);
