@@ -176,11 +176,16 @@ function ItemPage({ slug }: { slug: string }) {
   useEffect(() => {
     if (!auction || auction.closed) return;
     const closingMs = Date.parse(auction.closingTime);
+    const viewerQuery = activeUser
+      ? `?viewerId=${encodeURIComponent(activeUser.id)}`
+      : '';
     const timer = window.setInterval(() => {
       if (Date.now() < closingMs && !auction.ended) return;
       void (async () => {
         try {
-          const response = await fetch(`/api/auctions/${encodeURIComponent(slug)}`);
+          const response = await fetch(
+            `/api/auctions/${encodeURIComponent(slug)}${viewerQuery}`
+          );
           if (!response.ok) return;
           const body = (await response.json()) as { auction: Auction; bids: Bid[] };
           setAuction(body.auction);
@@ -198,7 +203,7 @@ function ItemPage({ slug }: { slug: string }) {
       })();
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [auction?.closed, auction?.ended, auction?.closingTime, slug]);
+  }, [auction?.closed, auction?.ended, auction?.closingTime, slug, activeUser?.id]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -208,9 +213,15 @@ function ItemPage({ slug }: { slug: string }) {
 
     async function loadAuction(mode: 'initial' | 'refresh') {
       try {
-        const response = await fetch(`/api/auctions/${encodeURIComponent(slug)}`, {
-          signal: controller.signal,
-        });
+        const viewerQuery = activeUser
+          ? `?viewerId=${encodeURIComponent(activeUser.id)}`
+          : '';
+        const response = await fetch(
+          `/api/auctions/${encodeURIComponent(slug)}${viewerQuery}`,
+          {
+            signal: controller.signal,
+          }
+        );
         if (response.status === 404) {
           if (mode === 'initial') setMissing(true);
           return;
@@ -280,7 +291,7 @@ function ItemPage({ slug }: { slug: string }) {
         socket.disconnect();
       }
     };
-  }, [slug]);
+  }, [slug, activeUser?.id]);
 
   if (loading) {
     return <main className="container empty-state"><p className="eyebrow">Loading</p><h1>Fetching this auction…</h1></main>;
@@ -473,26 +484,34 @@ function ItemPage({ slug }: { slug: string }) {
                 )}
               </div>
             ) : null}
-            {closed && auction.outcome === 'sold' ? (
+            {closed && auction.outcome === 'sold' && auction.purchase ? (
               <div className="purchase-panel" data-testid="purchase-panel">
                 <span>Purchase</span>
                 <strong data-testid="purchase-status">
-                  {auction.purchase?.status === 'paid' ? 'Paid' : 'Unpaid'}
+                  {auction.purchase.status === 'paid' ? 'Paid' : 'Unpaid'}
                 </strong>
                 <small>
-                  {auction.purchase
-                    ? formatCurrencyFromCents(auction.purchase.amountCents)
-                    : auction.winningAmountCents != null
-                      ? formatCurrencyFromCents(auction.winningAmountCents)
-                      : '—'}
+                  {formatCurrencyFromCents(auction.purchase.amountCents)}
                   {isWinner ? ' · you are the winner' : null}
+                  {isSeller ? ' · you are the seller' : null}
                 </small>
-                {checkoutQuery === 'success' && auction.purchase?.status === 'paid' ? (
+                {isSeller && auction.purchase.status === 'unpaid' ? (
+                  <p className="purchase-hint" data-testid="seller-recovery-hint">
+                    Waiting for the winner to pay. They can retry checkout anytime — including
+                    after a dropped mock payment session.
+                  </p>
+                ) : null}
+                {isSeller && auction.purchase.status === 'paid' ? (
+                  <p className="form-success" role="status" data-testid="seller-paid-hint">
+                    Winner payment received.
+                  </p>
+                ) : null}
+                {checkoutQuery === 'success' && auction.purchase.status === 'paid' ? (
                   <p className="form-success" role="status">
                     Payment confirmed.
                   </p>
                 ) : null}
-                {checkoutQuery === 'canceled' && auction.purchase?.status !== 'paid' ? (
+                {checkoutQuery === 'canceled' && auction.purchase.status !== 'paid' && isWinner ? (
                   <p className="form-error" role="status">
                     Checkout canceled. You can try again when ready.
                   </p>

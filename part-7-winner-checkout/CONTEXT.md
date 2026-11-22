@@ -107,3 +107,7 @@ _Avoid_: Settled (as a synonym here), captured, charged (as UI-only wording)
 **Checkout**:
 The Winner-started flow that opens a payment session against the local Stripe-shaped mock and returns the Winner to Auction House afterward.
 _Avoid_: Real Stripe account setup, API-key configuration, Buyer (use Winner)
+
+**Payment visibility**:
+Whether a Purchase is Unpaid or Paid, shown only to the Seller and the Winner of that Auction.
+_Avoid_: Public payment status, bidder-wide ledger

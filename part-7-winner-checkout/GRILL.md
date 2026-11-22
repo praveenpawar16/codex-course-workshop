@@ -55,4 +55,4 @@ Minimal fixes only as required for the decisions above: weak create idempotency 
 1. **Winner checkout and authoritative paid state** — Copy Part 6 baseline into Part 7; Winner can start Checkout for a Closed Auction with a Winning amount; server creates/reuses a Purchase priced from the recorded outcome; mock session + payment page; signed webhook marks Paid replay-safely; success/decline/cancel/retry work; start button disables while checkout is starting; detail UI shows unpaid vs Paid for the Winner.
 2. **Seller payment visibility and recovery** — Seller sees whether the Winner’s Purchase is unpaid or Paid; recovery path when payment did not complete (Winner can retry; Seller can tell unpaid vs Paid without guessing).
 
-Slice 1 approved and in progress. Slice 2 waits for browser review of Slice 1.
+Slice 1 shipped. Slice 2 shipped (seller payment visibility, role-gated Purchase payloads, vanished-session recovery).

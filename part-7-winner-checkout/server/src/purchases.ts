@@ -16,7 +16,7 @@ export type PurchaseRow = {
 };
 
 export type PurchaseView = {
-  id: string;
+  id: string | null;
   status: 'unpaid' | 'paid';
   amountCents: number;
   paidAt: string | null;
@@ -50,6 +50,91 @@ export function serializePurchase(row: PurchaseRow): PurchaseView {
     amountCents: row.amount_cents,
     paidAt: row.paid_at ? new Date(row.paid_at).toISOString() : null,
   };
+}
+
+/** Purchase details are only for the Seller or Winner of a sold Closed Auction. */
+export function purchaseVisibleTo(input: {
+  viewerId: string | null | undefined;
+  sellerId: string;
+  winnerId: string | null;
+}): boolean {
+  if (!input.viewerId || !input.winnerId) return false;
+  return input.viewerId === input.sellerId || input.viewerId === input.winnerId;
+}
+
+export function unpaidPurchaseFromWinningAmount(amountCents: number): PurchaseView {
+  return {
+    id: null,
+    status: 'unpaid',
+    amountCents,
+    paidAt: null,
+  };
+}
+
+export async function clearCheckoutSession(
+  pool: pg.Pool | pg.PoolClient,
+  purchaseId: string
+): Promise<void> {
+  await pool.query(
+    `UPDATE purchases SET stripe_checkout_session_id = NULL WHERE id = $1 AND status = 'unpaid'`,
+    [purchaseId]
+  );
+}
+
+export async function fetchCheckoutSession(
+  sessionId: string
+): Promise<{ id: string; url: string; status: string; payment_status: string } | null> {
+  try {
+    const response = await fetch(`${stripeBaseUrl}/v1/checkout/sessions/${sessionId}`);
+    if (response.status === 404) return null;
+    if (!response.ok) return null;
+    const body = (await response.json()) as {
+      id?: string;
+      url?: string;
+      status?: string;
+      payment_status?: string;
+    };
+    if (!body.id || !body.url || !body.status || !body.payment_status) return null;
+    return {
+      id: body.id,
+      url: body.url,
+      status: body.status,
+      payment_status: body.payment_status,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reuse a live mock session when present; if the stored session disappeared
+ * (mock restart / memory wipe), clear it and create a fresh session for the same Purchase.
+ */
+export async function resolveCheckoutSession(input: {
+  purchase: PurchaseRow;
+  title: string;
+  slug: string;
+  pool: pg.Pool | pg.PoolClient;
+}): Promise<{ id: string; url: string; recovered: boolean }> {
+  if (input.purchase.stripe_checkout_session_id) {
+    const existing = await fetchCheckoutSession(input.purchase.stripe_checkout_session_id);
+    if (existing && existing.status === 'open') {
+      return { id: existing.id, url: existing.url, recovered: false };
+    }
+    if (existing && existing.status === 'complete') {
+      return { id: existing.id, url: existing.url, recovered: false };
+    }
+    await clearCheckoutSession(input.pool, input.purchase.id);
+  }
+
+  const created = await createCheckoutSession({
+    purchaseId: input.purchase.id,
+    title: input.title,
+    amountCents: input.purchase.amount_cents,
+    slug: input.slug,
+  });
+  const recovered = Boolean(input.purchase.stripe_checkout_session_id);
+  return { ...created, recovered };
 }
 
 export async function loadPurchaseForAuction(

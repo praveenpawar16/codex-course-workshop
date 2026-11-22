@@ -10,11 +10,13 @@ import {
 } from './notifyClose.js';
 import {
   applyStripeWebhook,
-  createCheckoutSession,
   getOrCreatePurchase,
   loadPurchaseForAuction,
+  purchaseVisibleTo,
   rememberCheckoutSession,
+  resolveCheckoutSession,
   serializePurchase,
+  unpaidPurchaseFromWinningAmount,
   type PurchaseView,
 } from './purchases.js';
 
@@ -161,12 +163,26 @@ function serializeAuction(row: AuctionRow, now: Date, purchase: PurchaseView | n
   };
 }
 
-async function purchaseViewForAuction(
+async function purchaseViewForViewer(
   pool: pg.Pool | pg.PoolClient,
-  auctionId: string
+  row: AuctionRow,
+  viewerId: string | null | undefined
 ): Promise<PurchaseView | null> {
-  const row = await loadPurchaseForAuction(pool, auctionId);
-  return row ? serializePurchase(row) : null;
+  if (
+    !purchaseVisibleTo({
+      viewerId,
+      sellerId: row.seller_id,
+      winnerId: row.winner_id,
+    })
+  ) {
+    return null;
+  }
+  if (!row.closed_at || !row.winner_id || row.winning_amount_cents == null) {
+    return null;
+  }
+  const stored = await loadPurchaseForAuction(pool, row.id);
+  if (stored) return serializePurchase(stored);
+  return unpaidPurchaseFromWinningAmount(row.winning_amount_cents);
 }
 
 function serializeBid(row: BidRow) {
@@ -329,12 +345,8 @@ export function buildApp(options: BuildAppOptions = {}) {
     const result = await pool.query<AuctionRow>(
       `${auctionSelect} ORDER BY a.closing_time ASC`
     );
-    const auctions = await Promise.all(
-      result.rows.map(async (row) =>
-        serializeAuction(row, at, await purchaseViewForAuction(pool, row.id))
-      )
-    );
-    return { auctions };
+    // List payloads omit Purchase; payment details are role-gated on the detail route.
+    return { auctions: result.rows.map((row) => serializeAuction(row, at, null)) };
   });
 
   app.post('/api/auctions', async (request, reply) => {
@@ -411,19 +423,27 @@ export function buildApp(options: BuildAppOptions = {}) {
     return reply.code(201).send({ auction: serializeAuction(row, at), bids: [] });
   });
 
-  app.get<{ Params: { slug: string } }>('/api/auctions/:slug', async (request, reply) => {
-    const result = await pool.query<AuctionRow>(
-      `${auctionSelect} WHERE a.slug = $1`,
-      [request.params.slug]
-    );
-    const row = result.rows[0];
-    if (!row) {
-      return reply.code(404).send({ error: 'Auction not found' });
+  app.get<{ Params: { slug: string }; Querystring: { viewerId?: string } }>(
+    '/api/auctions/:slug',
+    async (request, reply) => {
+      const viewerId =
+        typeof request.query.viewerId === 'string' &&
+        z.string().uuid().safeParse(request.query.viewerId).success
+          ? request.query.viewerId
+          : null;
+      const result = await pool.query<AuctionRow>(
+        `${auctionSelect} WHERE a.slug = $1`,
+        [request.params.slug]
+      );
+      const row = result.rows[0];
+      if (!row) {
+        return reply.code(404).send({ error: 'Auction not found' });
+      }
+      const bids = await loadBids(pool, row.id);
+      const purchase = await purchaseViewForViewer(pool, row, viewerId);
+      return { auction: serializeAuction(row, now(), purchase), bids };
     }
-    const bids = await loadBids(pool, row.id);
-    const purchase = await purchaseViewForAuction(pool, row.id);
-    return { auction: serializeAuction(row, now(), purchase), bids };
-  });
+  );
 
   app.post<{ Params: { slug: string } }>(
     '/api/auctions/:slug/checkout',
@@ -482,13 +502,13 @@ export function buildApp(options: BuildAppOptions = {}) {
 
         await client.query('COMMIT');
 
-        let session: { id: string; url: string };
+        let session: { id: string; url: string; recovered: boolean };
         try {
-          session = await createCheckoutSession({
-            purchaseId: purchase.id,
+          session = await resolveCheckoutSession({
+            purchase,
             title: auction.title,
-            amountCents: purchase.amount_cents,
             slug: auction.slug,
+            pool,
           });
         } catch (error) {
           const statusCode =
@@ -516,6 +536,7 @@ export function buildApp(options: BuildAppOptions = {}) {
         return {
           purchase: serializePurchase(latestPurchase ?? purchase),
           checkoutUrl: session.url,
+          recovered: session.recovered,
           auction: serializeAuction(
             row,
             now(),

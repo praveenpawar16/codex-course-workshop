@@ -106,8 +106,25 @@ describe('winner checkout', () => {
     expect(startedBody.purchase).toMatchObject({ status: 'unpaid', amountCents: amount });
     expect(startedBody.checkoutUrl).toMatch(/^http:\/\/127\.0\.0\.1:7107\/checkout\/cs_test_/);
 
-    const detail = await app.inject({ method: 'GET', url: `/api/auctions/${slug}` });
+    const stranger = await app.inject({
+      method: 'GET',
+      url: `/api/auctions/${slug}?viewerId=${otherId}`,
+    });
+    expect(stranger.json().auction.purchase).toBeNull();
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/auctions/${slug}?viewerId=${winnerId}`,
+    });
     expect(detail.json().auction.purchase).toMatchObject({
+      status: 'unpaid',
+      amountCents: amount,
+    });
+    const sellerView = await app.inject({
+      method: 'GET',
+      url: `/api/auctions/${slug}?viewerId=${sellerId}`,
+    });
+    expect(sellerView.json().auction.purchase).toMatchObject({
       status: 'unpaid',
       amountCents: amount,
     });
@@ -161,7 +178,10 @@ describe('winner checkout', () => {
     expect(replay.statusCode).toBe(200);
     expect(replay.json()).toMatchObject({ ok: true, replayed: true, purchase: { status: 'paid' } });
 
-    const after = await app.inject({ method: 'GET', url: `/api/auctions/${slug}` });
+    const after = await app.inject({
+      method: 'GET',
+      url: `/api/auctions/${slug}?viewerId=${sellerId}`,
+    });
     expect(after.json().auction.purchase.status).toBe('paid');
 
     const again = await app.inject({
@@ -174,6 +194,50 @@ describe('winner checkout', () => {
       checkoutUrl: null,
       purchase: { status: 'paid' },
     });
+  });
+
+  it('recovers checkout when a stored unpaid mock session has disappeared', async () => {
+    const all = await users();
+    const sellerId = all[0]!.id;
+    const winnerId = all[1]!.id;
+    const amount = 11_100;
+    const { id: auctionId, slug } = await createSoldAuction({
+      sellerId,
+      winnerId,
+      title: `Checkout Recover ${Date.now()}`,
+      winningAmountCents: amount,
+    });
+
+    // Simulate a Purchase that points at a session wiped from mock memory (e.g. mock restart).
+    const purchaseId = randomUUID();
+    await pool.query(
+      `INSERT INTO purchases (id, auction_id, winner_id, amount_cents, status, stripe_checkout_session_id)
+       VALUES ($1, $2, $3, $4, 'unpaid', 'cs_test_vanished_session')`,
+      [purchaseId, auctionId, winnerId, amount]
+    );
+
+    const recovered = await app.inject({
+      method: 'POST',
+      url: `/api/auctions/${slug}/checkout`,
+      payload: { userId: winnerId },
+    });
+    expect(recovered.statusCode).toBe(200);
+    const body = recovered.json() as {
+      recovered: boolean;
+      checkoutUrl: string;
+      purchase: { id: string; status: string };
+    };
+    expect(body.recovered).toBe(true);
+    expect(body.purchase).toMatchObject({ id: purchaseId, status: 'unpaid' });
+    expect(body.checkoutUrl).toMatch(/^http:\/\/127\.0\.0\.1:7107\/checkout\/cs_test_/);
+    expect(body.checkoutUrl.split('/').pop()).not.toBe('cs_test_vanished_session');
+
+    const stored = await pool.query<{ stripe_checkout_session_id: string }>(
+      `SELECT stripe_checkout_session_id FROM purchases WHERE id = $1`,
+      [purchaseId]
+    );
+    expect(stored.rows[0]?.stripe_checkout_session_id).toMatch(/^cs_test_/);
+    expect(stored.rows[0]?.stripe_checkout_session_id).not.toBe('cs_test_vanished_session');
   });
 
   it('keeps the purchase unpaid after a declined mock payment', async () => {
@@ -203,7 +267,10 @@ describe('winner checkout', () => {
     });
     expect(declined.status).toBe(402);
 
-    const detail = await app.inject({ method: 'GET', url: `/api/auctions/${slug}` });
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/auctions/${slug}?viewerId=${winnerId}`,
+    });
     expect(detail.json().auction.purchase.status).toBe('unpaid');
   });
 });

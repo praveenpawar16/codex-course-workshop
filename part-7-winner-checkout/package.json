@@ -22,7 +22,8 @@
     "typecheck": "npm run typecheck --workspace server && npm run typecheck --workspace web",
     "test": "cross-env DATABASE_URL=postgres://auction:auction@localhost:55432/auction_part_7 REDIS_URL=redis://127.0.0.1:6307 npm run test --workspace server && npm run test --workspace web",
     "test:bidding-war": "node tests/bidding-war.mjs",
-    "test:live-updates": "node tests/live-updates.mjs"
+    "test:live-updates": "node tests/live-updates.mjs",
+    "test:checkout-recovery": "node tests/checkout-recovery.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

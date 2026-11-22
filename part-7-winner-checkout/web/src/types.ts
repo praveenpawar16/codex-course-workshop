@@ -16,7 +16,7 @@ export type Bid = {
 export type AuctionOutcome = 'sold' | 'unsold';
 
 export type Purchase = {
-  id: string;
+  id: string | null;
   status: 'unpaid' | 'paid';
   amountCents: number;
   paidAt: string | null;

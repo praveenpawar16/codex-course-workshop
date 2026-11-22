@@ -43,6 +43,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .bid-form .form-error { margin-top: 8px; }
 .purchase-panel { grid-column: 1 / -1; display: grid; gap: 6px; padding-top: 12px; border-top: 1px solid var(--line); }
 .purchase-panel strong { font-size: 16px; letter-spacing: -.03em; }
+.purchase-hint { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.35; }
 .checkout-action { margin-top: 8px; height: 40px; border: 0; border-radius: 8px; background: var(--ink); color: var(--paper); font-weight: 700; cursor: pointer; }
 .checkout-action:disabled { opacity: .6; cursor: wait; }
 .bid-history { margin-top: 44px; padding-top: 31px; border-top: 1px solid var(--line); }
