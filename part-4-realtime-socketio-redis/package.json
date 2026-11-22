@@ -1,0 +1,25 @@
+{
+  "name": "auction-house",
+  "private": true,
+  "workspaces": ["server", "web"],
+  "scripts": {
+    "db:up": "node ../scripts/workshop-db.mjs up auction_part_4",
+    "db:down": "node ../scripts/workshop-db.mjs drop auction_part_4",
+    "db:reset": "npm run db:down && npm run db:up && npm run migrate",
+    "redis:up": "docker compose -f ../docker-compose.yml up -d --wait redis",
+    "migrate": "cross-env DATABASE_URL=postgres://auction:auction@localhost:55432/auction_part_4 npm run migrate --workspace server",
+    "dev": "cross-env API_PORT=3104 WEB_PORT=5104 DATABASE_URL=postgres://auction:auction@localhost:55432/auction_part_4 REDIS_URL=redis://127.0.0.1:56379 concurrently -k -n server,web \"npm run dev --workspace server\" \"npm run dev --workspace web\"",
+    "start": "npm run db:up && npm run redis:up && npm run migrate && npm run dev",
+    "typecheck": "npm run typecheck --workspace server && npm run typecheck --workspace web",
+    "test": "cross-env DATABASE_URL=postgres://auction:auction@localhost:55432/auction_part_4 REDIS_URL=redis://127.0.0.1:56379 npm run test --workspace server && npm run test --workspace web",
+    "test:bidding-war": "node tests/bidding-war.mjs",
+    "test:live-updates": "node tests/live-updates.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "cross-env": "^7.0.3",
+    "pg": "^8.16.3",
+    "playwright": "^1.56.1",
+    "socket.io-client": "^4.8.1"
+  }
+}
